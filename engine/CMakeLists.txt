@@ -31,16 +31,14 @@ find_package(Threads REQUIRED)
 
 # ---- ONNX Runtime ----
 if(DURAKK_USE_ONNX)
-    # Способ 1: vcpkg (рекомендуется на Windows)
-    # find_package(onnxruntime CONFIG REQUIRED)
-    #
-    # Способ 2: системная установка (Linux/macOS)
-    find_library(ONNXRUNTIME_LIB onnxruntime)
-    find_path(ONNXRUNTIME_INCLUDE onnxruntime_cxx_api.h
-              PATHS /usr/include /usr/local/include /opt/onnxruntime/include)
-    if(NOT ONNXRUNTIME_LIB OR NOT ONNXRUNTIME_INCLUDE)
-        message(WARNING "ONNX Runtime не найден — OnnxNet будет заглушкой. "
-                "Установите через vcpkg или пакетный менеджер.")
+    set(ONNX_ROOT "C:/Users/danas/Desktop/onnxruntime/onnxruntime-win-x64-1.17.1")
+    find_library(ONNXRUNTIME_LIB onnxruntime PATHS "${ONNX_ROOT}/lib")
+    find_path(ONNXRUNTIME_INCLUDE onnxruntime_cxx_api.h PATHS "${ONNX_ROOT}/include")
+    
+    if(ONNXRUNTIME_LIB AND ONNXRUNTIME_INCLUDE)
+        message(STATUS "Found ONNX Runtime: ${ONNXRUNTIME_LIB}")
+    else()
+        message(WARNING "ONNX Runtime не найден в ${ONNX_ROOT} — OnnxNet будет заглушкой.")
         set(DURAKK_USE_ONNX OFF)
     endif()
 endif()
@@ -137,3 +135,17 @@ add_custom_command(TARGET durakk_env POST_BUILD
         $<TARGET_FILE:durakk_env>
         ${CMAKE_CURRENT_SOURCE_DIR}/../durakk_env$<IF:$<BOOL:${WIN32}>,.pyd,.so>
 )
+
+if(DURAKK_USE_ONNX AND ONNXRUNTIME_LIB)
+    add_custom_command(TARGET durakk_env POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${ONNX_ROOT}/lib/onnxruntime.dll"
+            ${CMAKE_CURRENT_SOURCE_DIR}/../onnxruntime.dll
+    )
+    
+    add_custom_command(TARGET durakk_engine POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${ONNX_ROOT}/lib/onnxruntime.dll"
+            $<TARGET_FILE_DIR:durakk_engine>
+    )
+endif()

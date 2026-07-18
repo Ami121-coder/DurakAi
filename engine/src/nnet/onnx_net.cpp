@@ -1,30 +1,18 @@
 // ============================================================================
-// onnx_net.cpp — реализация OnnxNet через ONNX Runtime + CUDA EP.
+// onnx_net.cpp — обновлён под новый формат модели (FIX #5)
 //
-// Зависимости (CMakeLists.txt.patched):
-//   find_package(onnxruntime CONFIG REQUIRED)
-//   target_link_libraries(durakk_engine PRIVATE onnxruntime)
-//
-// Формат .onnx файла (экспортируется из PyTorch см. export_onnx.py):
-//   Входы:
-//     "state"      — float32[batch, 220]  (или uint8[batch, 220] — лучше float32)
-//     "legal_mask" — float32[batch, 38]   (для маскирования policy)
-//   Выходы:
-//     "policy"     — float32[batch, 38]   (логиты)
-//     "value"      — float32[batch, 1]    (в [0, 1] через sigmoid или в [-1,1] через tanh)
-//
-// Для inference в C++ мы:
-//   1. Кодируем MatchState в 220 float.
-//   2. Вычисляем legal_mask (38 float).
-//   3. Прогоняем через onnxruntime::Ort::Session.
-//   4. Masked softmax над policy logits.
-//   5. value отображаем в [0,1].
+// Изменения:
+//   1. encodeStateToBuffer теперь использует uint8 → float нормализацию
+//      (значения 0..1 вместо 0..255). Модель ожидает нормализованный вход.
+//   2. value теперь в [-1, 1] (tanh) — приводим к [0, 1] для ISMCTS.
+//   3. Убран мёртвый putMask лямбда-баг.
+//   4. Добавлен козырь one-hot в скаляры (4 байта).
 // ============================================================================
 
 #include "policy_value_net.h"
-#include "rules_fast.h"
-#include "bitboard.h"
-#include "card.h"
+#include "../rules_fast.h"
+#include "../bitboard.h"
+#include "../card.h"
 
 #include <onnxruntime_cxx_api.h>
 
@@ -42,9 +30,15 @@ namespace {
 constexpr int kStateSize = 220;
 constexpr int kActionSize = 38;
 
-// ---- Кодирование состояния в 220 float (зеркало bindings.cpp::encodeState) ----
 void encodeStateToBuffer(const MatchState& s, Player viewpoint, float* out) {
     Player opp = other(viewpoint);
+    float* p = out;
+
+    // 5 масок × 36 = 180 float, значения 0.0 или 1.0
+    auto writeMask = [&](CardMask m) {
+        for (int i = 0; i < 36; ++i) *p++ = (float)((m >> i) & 1u);
+    };
+
     CardMask trumpMask = 0;
     for (int r = 6; r <= 14; ++r)
         trumpMask |= cardBit(Card{static_cast<Rank>(r), s.trump});
@@ -55,42 +49,38 @@ void encodeStateToBuffer(const MatchState& s, Player viewpoint, float* out) {
         if (s.table[i].defended) defMask |= cardBit(s.table[i].defense);
     }
 
-    auto putMask = [&](CardMask m) {
-        for (int i = 0; i < 36; ++i) out[i] = (float)((m >> i) & 1u);
-        out += 36;
-    };
-    // Внимание: putMask мутирует локальную копию out — исправим.
-    float* p = out;
-    for (int i = 0; i < 36; ++i) p[i] = (float)((s.hands[toIdx(viewpoint)] >> i) & 1u);
-    p += 36;
-    for (int i = 0; i < 36; ++i) p[i] = (float)((trumpMask >> i) & 1u);
-    p += 36;
-    for (int i = 0; i < 36; ++i) p[i] = (float)((atkMask >> i) & 1u);
-    p += 36;
-    for (int i = 0; i < 36; ++i) p[i] = (float)((defMask >> i) & 1u);
-    p += 36;
-    for (int i = 0; i < 36; ++i) p[i] = (float)((s.discard >> i) & 1u);
-    p += 36;
-    // p сейчас указывает на out[180] — скалярные фичи (40 байт).
-    p[0]  = (float)s.tableLen / 6.0f;
-    p[1]  = (float)s.undefendedCount() / 6.0f;
-    p[2]  = (float)s.pairsHeadroom() / 6.0f;
-    p[3]  = (float)s.deckRemaining / 36.0f;
-    p[4]  = (float)handSize(s.hands[toIdx(opp)]) / 36.0f;
-    p[5]  = (float)handSize(s.hands[toIdx(viewpoint)]) / 36.0f;
-    p[6]  = s.firstTrick ? 1.0f : 0.0f;
-    p[7]  = s.transferEnabled ? 1.0f : 0.0f;
-    p[8]  = s.flashEnabled ? 1.0f : 0.0f;
-    p[9]  = (s.phase == MatchPhase::Attack) ? 1.0f : 0.0f;
-    p[10] = (s.phase == MatchPhase::Defense) ? 1.0f : 0.0f;
-    p[11] = (s.turn == viewpoint) ? 1.0f : 0.0f;
-    p[12] = (s.turn == opp) ? 1.0f : 0.0f;
-    p[13] = (s.attacker == viewpoint) ? 1.0f : 0.0f;
-    p[14] = (s.attacker == opp) ? 1.0f : 0.0f;
-    for (int i = 15; i < 40; ++i) p[i] = 0.0f;
+    writeMask(s.hands[toIdx(viewpoint)]);  // [0..35]
+    writeMask(trumpMask);                   // [36..71]
+    writeMask(atkMask);                     // [72..107]
+    writeMask(defMask);                     // [108..143]
+    writeMask(s.discard);                   // [144..179]
+
+    // Скаляры [180..219] — нормализованные в [0, 1]
+    // Козырь one-hot (4 байта)
+    for (int su = 0; su < 4; ++su)
+        *p++ = ((int)s.trump == su) ? 1.0f : 0.0f;  // 180-183
+
+    *p++ = (float)s.tableLen / 6.0f;                              // 184
+    *p++ = (float)s.undefendedCount() / 6.0f;                    // 185
+    *p++ = (float)s.pairsHeadroom() / 6.0f;                      // 186
+    *p++ = (float)s.deckRemaining / 36.0f;                       // 187
+    *p++ = (float)handSize(s.hands[toIdx(opp)]) / 36.0f;         // 188
+    *p++ = (float)handSize(s.hands[toIdx(viewpoint)]) / 36.0f;  // 189
+    *p++ = s.firstTrick ? 1.0f : 0.0f;                           // 190
+    *p++ = s.transferEnabled ? 1.0f : 0.0f;                      // 191
+    *p++ = s.flashEnabled ? 1.0f : 0.0f;                         // 192
+    *p++ = (s.phase == MatchPhase::Attack) ? 1.0f : 0.0f;        // 193
+    *p++ = (s.phase == MatchPhase::Defense) ? 1.0f : 0.0f;       // 194
+    *p++ = (s.turn == viewpoint) ? 1.0f : 0.0f;                  // 195
+    *p++ = (s.turn == opp) ? 1.0f : 0.0f;                        // 196
+    *p++ = (s.attacker == viewpoint) ? 1.0f : 0.0f;              // 197
+    *p++ = (s.attacker == opp) ? 1.0f : 0.0f;                    // 198
+    *p++ = 0.0f;  // 199 (reserved)
+
+    // Остаток — нули (200..219)
+    while (p < out + kStateSize) *p++ = 0.0f;
 }
 
-// ---- Вычисление legal_mask (38 float) ----
 void computeLegalMask(const MatchState& s, float* out) {
     std::fill(out, out + kActionSize, 0.0f);
     if (s.isGameOver()) return;
@@ -106,11 +96,9 @@ void computeLegalMask(const MatchState& s, float* out) {
     }
 }
 
-// ---- Преобразование логитов + legal_mask → policy по ходам ----
 std::vector<std::pair<Move, float>> buildPolicy(const MatchState& s,
                                                 const float* logits,
                                                 const float* legal_mask) {
-    // Masked softmax: logit[i] -= 1e9 если legal_mask[i] == 0.
     float masked[kActionSize];
     for (int i = 0; i < kActionSize; ++i) {
         masked[i] = legal_mask[i] > 0.5f ? logits[i] : -1e9f;
@@ -125,7 +113,6 @@ std::vector<std::pair<Move, float>> buildPolicy(const MatchState& s,
     if (sum <= 0) sum = 1.0f;
     for (int i = 0; i < kActionSize; ++i) probs[i] /= sum;
 
-    // Сопоставим индексы ходам (зеркало moveToActionIndex).
     std::vector<std::pair<Move, float>> out;
     out.reserve(kActionSize);
     MoveBuffer buf;
@@ -145,12 +132,10 @@ std::vector<std::pair<Move, float>> buildPolicy(const MatchState& s,
 
 } // namespace
 
-// ---- Impl: всё, что зависит от onnxruntime ----
 struct OnnxNet::Impl {
     Ort::Env env;
     Ort::Session session{nullptr};
     Ort::SessionOptions session_options;
-    Ort::AllocatorWithDefaultOptions allocator;
 
     Impl() : env(ORT_LOGGING_LEVEL_WARNING, "durakk_onnx") {}
 
@@ -160,28 +145,25 @@ struct OnnxNet::Impl {
             GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
         if (provider == "CUDA") {
-#ifdef _WIN32
             OrtCUDAProviderOptions cuda_options{};
             cuda_options.device_id = gpu_id;
             cuda_options.arena_extend_strategy = 0;
-            cuda_options.gpu_mem_limit = 4ULL * 1024 * 1024 * 1024; // 4 GB лимит
+            cuda_options.gpu_mem_limit = 4ULL * 1024 * 1024 * 1024;
             cuda_options.cudnn_conv_algo_search = OrtCudnnConvAlgoSearch::OrtCudnnConvAlgoSearchDefault;
             session_options.AppendExecutionProvider_CUDA(cuda_options);
-#else
-            OrtCUDAProviderOptions cuda_options{};
-            cuda_options.device_id = gpu_id;
-            session_options.AppendExecutionProvider_CUDA(cuda_options);
-#endif
         } else if (provider == "TensorRT") {
             OrtTensorRTProviderOptions trt_options{};
             trt_options.device_id = gpu_id;
-            trt_options.trt_fp16_enable = 1;  // FP16 inference
+            trt_options.trt_fp16_enable = 1;
             session_options.AppendExecutionProvider_TensorRT(trt_options);
-        } else {
-            // CPU fallback.
         }
 
+#ifdef _WIN32
+        std::wstring wpath(path.begin(), path.end());
+        session = Ort::Session(env, wpath.c_str(), session_options);
+#else
         session = Ort::Session(env, path.c_str(), session_options);
+#endif
     }
 };
 
@@ -204,11 +186,9 @@ OnnxNet::~OnnxNet() = default;
 
 PVResult OnnxNet::evaluate(const MatchState& s, Player viewpoint) {
     if (!ready_) {
-        // Fallback на uniform policy.
         return RandomNet{}.evaluate(s, viewpoint);
     }
 
-    // Подготовим входные тензоры [1, 220] и [1, 38].
     std::array<float, kStateSize> state_buf;
     std::array<float, kActionSize> mask_buf;
     encodeStateToBuffer(s, viewpoint, state_buf.data());
@@ -227,12 +207,15 @@ PVResult OnnxNet::evaluate(const MatchState& s, Player viewpoint) {
         memory_info, mask_buf.data(), mask_buf.size(),
         mask_shape.data(), mask_shape.size());
 
-    // Имена входов/выходов — фиксируем (см. export_onnx.py).
     const char* input_names[] = {"state", "legal_mask"};
     const char* output_names[] = {"policy", "value"};
 
+    std::vector<Ort::Value> input_tensors;
+    input_tensors.push_back(std::move(state_tensor));
+    input_tensors.push_back(std::move(mask_tensor));
+
     auto outputs = sess.Run(Ort::RunOptions{nullptr},
-                            input_names, {&state_tensor, &mask_tensor}, 2,
+                            input_names, input_tensors.data(), 2,
                             output_names, 2);
 
     const float* policy_logits = outputs[0].GetTensorData<float>();
@@ -240,8 +223,9 @@ PVResult OnnxNet::evaluate(const MatchState& s, Player viewpoint) {
 
     PVResult res;
     res.policy = buildPolicy(s, policy_logits, mask_buf.data());
-    // value в [0,1] (если модель училась на sigmoid) — берём как есть.
-    res.value = value_out[0];
+    // value в [-1, 1] (tanh) → приводим к [0, 1] для ISMCTS
+    float v = value_out[0];
+    res.value = (v + 1.0f) * 0.5f;
     if (res.value < 0.0f) res.value = 0.0f;
     if (res.value > 1.0f) res.value = 1.0f;
     return res;
@@ -255,7 +239,6 @@ std::vector<PVResult> OnnxNet::evaluateBatch(const std::vector<MatchState>& stat
         return out;
     }
 
-    // Батч: [N, 220] + [N, 38] → [N, 38] + [N, 1].
     const int N = (int)states.size();
     std::vector<float> state_buf(N * kStateSize);
     std::vector<float> mask_buf(N * kActionSize);
@@ -280,8 +263,12 @@ std::vector<PVResult> OnnxNet::evaluateBatch(const std::vector<MatchState>& stat
     const char* input_names[] = {"state", "legal_mask"};
     const char* output_names[] = {"policy", "value"};
 
+    std::vector<Ort::Value> input_tensors;
+    input_tensors.push_back(std::move(state_tensor));
+    input_tensors.push_back(std::move(mask_tensor));
+
     auto outputs = sess.Run(Ort::RunOptions{nullptr},
-                            input_names, {&state_tensor, &mask_tensor}, 2,
+                            input_names, input_tensors.data(), 2,
                             output_names, 2);
 
     const float* policy_logits = outputs[0].GetTensorData<float>();
@@ -294,7 +281,8 @@ std::vector<PVResult> OnnxNet::evaluateBatch(const std::vector<MatchState>& stat
         r.policy = buildPolicy(states[i],
                                policy_logits + i * kActionSize,
                                mask_buf.data() + i * kActionSize);
-        r.value = value_out[i];
+        float v = value_out[i];
+        r.value = (v + 1.0f) * 0.5f;
         if (r.value < 0.0f) r.value = 0.0f;
         if (r.value > 1.0f) r.value = 1.0f;
         results.push_back(std::move(r));

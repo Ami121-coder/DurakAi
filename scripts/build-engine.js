@@ -74,9 +74,12 @@ if (!cmake) {
 }
 log('CMake:', cmake);
 
+const vcpkgToolchain = path.join('C:\\', 'vcpkg', 'scripts', 'buildsystems', 'vcpkg.cmake');
+const vcpkgArg = fs.existsSync(vcpkgToolchain) ? `-DCMAKE_TOOLCHAIN_FILE="${vcpkgToolchain}"` : '';
+
 const cmd = [
     `"${vcvars}"`,
-    `&& "${cmake}" -S "${ENGINE}" -B "${BUILD}" -A x64`,
+    `&& "${cmake}" -S "${ENGINE}" -B "${BUILD}" -A x64 ${vcpkgArg}`,
     `&& "${cmake}" --build "${BUILD}" --config Release --parallel`,
 ].join(' ');
 

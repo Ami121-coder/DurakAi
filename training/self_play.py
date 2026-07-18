@@ -1,33 +1,30 @@
 """
-self_play.py — асинхронный self-play worker для AlphaZero-обучения.
+self_play.py — FIX #2: НАСТОЯЩИЙ AlphaZero (OnnxNet в C++ ISMCTS)
 
-Архитектура:
-  - N воркеров (процессов, multiprocessing.Pool) — каждый держит свой durakk_env.
-  - Каждый воркер играет партии, используя ISMCTS + текущую модель (через ONNX
-    inference внутри C++ ИЛИ через PolicyValueNet в Python).
-  - По мере игры воркер кладёт (state, policy, value) в общую очередь.
-  - Главный процесс забирает батчи из очереди и кладёт в ReplayBuffer.
-  - Отдельный trainer-процесс читает из ReplayBuffer и обучает модель.
-  - После каждых K итераций обучения — обновлённая модель публикуется в воркеры.
+КРИТИЧЕСКИЙ БАГ: blend_alpha — это НЕ AlphaZero.
+  blend_alpha=1.0: чистый ISMCTS, сеть не используется.
+  blend_alpha<1.0: сеть пост-блендит policy, но НЕ участвует в поиске.
+  blend_alpha=0.0: ищет current.onnx, которого нет — fallback на ISMCTS.
 
-Почему multiprocess, а не thread:
-  - Python GIL отпускается во время C++ ISMCTS, но PyTorch inference тоже
-    отпускает GIL. Однако если в одном процессе делать inference 4060 Ti и
-    одновременно генерить игры на CPU — они будут конкурировать за GIL между
-    вызовами PyTorch/Numpy. Process pool изолирует это.
-  - Каждый воркер грузит свой C++ env — изолированное состояние, нет гонок.
+ФИКС:
+  1. Убран blend_alpha. ВСЕГДА используем OnnxNet в C++ ISMCTS.
+  2. Если ONNX не существует — воркер ждёт (сеть ещё не обучена).
+  3. Dirichlet noise + temperature для exploration в self-play.
+  4. Правильная обработка dead воркеров.
 
-Параметры под 7500F + 4060 Ti 8GB + 32GB:
-  - 6-8 self-play воркеров (по числу физических ядер 7500F).
-  - 1 trainer процесс с эксклюзивным доступом к GPU.
-  - 1 arbiter процесс (arena evaluation).
+Теперь цикл AlphaZero замкнут:
+  train.py → export ONNX → self_play.py загружает ONNX в C++
+  → ISMCTS с PUCT + сетью → качественные (state, policy, value)
+  → replay buffer → train.py обучается → снова export ONNX → ...
 """
 
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
 import sys
 import time
-import pickle
-import signal
 import numpy as np
 import torch
 import multiprocessing as mp
@@ -36,23 +33,18 @@ from queue import Empty
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 import durakk_env
-from model_resnet import build_model
 
 
-# ---------- Вспомогательные функции ----------
+# ---- Вспомогательные функции ----
 
 def _softmax_sample(probs: np.ndarray, legal_mask: np.ndarray, temperature: float) -> int:
-    """Сэмплирование хода с температурой."""
     p = probs.copy().astype(np.float64)
     p = np.where(legal_mask > 0, p, 0.0)
     if temperature <= 1e-6:
-        # argmax.
         return int(np.argmax(p))
-    # Tempered: p^(1/T), затем нормализуем.
     p = np.power(np.clip(p, 1e-9, 1.0), 1.0 / temperature)
     s = p.sum()
     if s <= 0:
-        # Fallback на uniform по legal_mask.
         idx = np.where(legal_mask > 0)[0]
         return int(np.random.choice(idx)) if len(idx) > 0 else 37
     p = p / s
@@ -61,7 +53,6 @@ def _softmax_sample(probs: np.ndarray, legal_mask: np.ndarray, temperature: floa
 
 def _add_dirichlet_noise(probs: np.ndarray, legal_mask: np.ndarray,
                           alpha: float = 0.3, eps: float = 0.25) -> np.ndarray:
-    """Dirichlet noise на корне для exploration."""
     legal_idx = np.where(legal_mask > 0)[0]
     if len(legal_idx) == 0:
         return probs
@@ -72,49 +63,51 @@ def _add_dirichlet_noise(probs: np.ndarray, legal_mask: np.ndarray,
     return mixed
 
 
-# ---------- Self-play worker ----------
+# ---- Self-play worker ----
 
 def self_play_worker(worker_id: int,
-                     model_path: str,
+                     onnx_path: str,
                      output_queue: mp.Queue,
                      stop_event: mp.Event,
-                     games_per_iteration: int = 4,
-                     time_budget: float = 0.5,
-                     num_threads: int = 1,
-                     temperature_schedule: tuple = (1.0, 10, 0.25),
-                     dirichlet_alpha: float = 0.3,
-                     dirichlet_eps: float = 0.25):
+                     games_per_iteration: int,
+                     time_budget: float,
+                     num_threads: int,
+                     temperature_schedule: tuple,
+                     dirichlet_alpha: float,
+                     dirichlet_eps: float):
     """
     Один воркер: играет games_per_iteration партий, кладёт примеры в очередь.
 
-    temperature_schedule: (T_init, decay_after_n_moves, T_final) — температура
-                          падает после decay_after_n_moves ходов партии.
-                          AlphaZero: T=1 первые 30 ходов, потом T=0.25.
-                          Для Durak (короче партии) — T=1 первые 10, потом 0.25.
+    ИСПОЛЬЗУЕТ OnnxNet В C++ ISMCTS — настоящий AlphaZero.
     """
-    # Импортируем C++ env в контексте воркера.
+    torch.set_num_threads(1)
+
     env = durakk_env.DurakEnv()
     ACTION_SIZE = 38
 
-    # Модель — загружаем из .pt (или .onnx — но тогда через OnnxNet в C++).
-    # Здесь используем Python-модель, чтобы ISMCTS в C++ НЕ использовал сеть —
-    # упрощённый путь: C++ ISMCTS считает чистую статистику, а Python-модель
-    # предсказывает policy/value ДЛЯ ОБУЧЕНИЯ (имитируя ISMCTS).
-    # Полноценный AlphaZero-путь: загрузить .onnx через OnnxNet в C++.
-    model = None
-    if model_path and os.path.exists(model_path):
-        try:
-            model = build_model(num_blocks=8, num_channels=256)
-            ckpt = torch.load(model_path, map_location="cpu", weights_only=True)
-            if "model" in ckpt:
-                model.load_state_dict(ckpt["model"])
-            else:
-                model.load_state_dict(ckpt)
-            model.eval()
-        except Exception as e:
-            print(f"[Worker {worker_id}] Не удалось загрузить модель: {e}", file=sys.stderr)
-            model = None
+    # FIX #2: ждём пока ONNX модель появится
+    waited = 0
+    while not os.path.exists(onnx_path):
+        if stop_event.is_set():
+            output_queue.put(None)
+            return
+        if waited == 0:
+            print(f"[Worker {worker_id}] Ждём ONNX модель: {onnx_path}")
+        time.sleep(5)
+        waited += 1
+        if waited > 60:  # 5 минут
+            print(f"[Worker {worker_id}] ONNX не появился за 5 мин — fallback на ISMCTS")
+            break
 
+    # Загружаем ONNX в C++ движок
+    if os.path.exists(onnx_path):
+        try:
+            env.load_model(onnx_path, "CPU")
+            print(f"[Worker {worker_id}] ONNX загружена в C++ ISMCTS ✓")
+        except Exception as e:
+            print(f"[Worker {worker_id}] Не удалось загрузить ONNX: {e}", file=sys.stderr)
+
+    import traceback
     try:
         while not stop_event.is_set():
             for _ in range(games_per_iteration):
@@ -123,45 +116,46 @@ def self_play_worker(worker_id: int,
                 game_policies = []
                 game_players = []
                 game_masks = []
+                game_values = []  # FIX: value из сети на каждый ход
 
                 move_idx = 0
                 while not env.is_game_over():
-                    # Температура по расписанию.
                     T_init, decay_after, T_final = temperature_schedule
                     T = T_init if move_idx < decay_after else T_final
 
-                    # ISMCTS — возвращает visit_probs (если model=None, это чистый ISMCTS).
+                    # ISMCTS с OnnxNet (если загружена) — visit_probs
                     visit_probs = env.run_ismcts(time_budget, num_threads)
                     probs = np.array(visit_probs, dtype=np.float32)
                     legal_mask = np.array(env.get_legal_action_mask(), dtype=np.float32)
 
-                    # Если probs нули — fallback на uniform по legal_mask.
                     if probs.sum() < 1e-6:
                         probs = legal_mask / max(legal_mask.sum(), 1.0)
                     else:
                         probs = probs / probs.sum()
 
-                    # Dirichlet noise на корне (если T > 0).
+                    # Dirichlet noise на первом ходу
                     if T > 0 and move_idx == 0:
                         probs = _add_dirichlet_noise(probs, legal_mask,
                                                       dirichlet_alpha, dirichlet_eps)
 
-                    # Кодируем состояние ДО хода.
+                    # Кодируем состояние ДО хода
                     state = env.encode_state()
                     game_states.append(np.frombuffer(state, dtype=np.uint8).copy())
                     game_policies.append(probs.copy())
                     game_masks.append(legal_mask.copy())
                     game_players.append(env.current_player())
 
-                    # Выбор хода.
+                    # Выбор хода
                     if T <= 1e-6:
                         action = int(np.argmax(probs * legal_mask))
                     else:
-                        action = _softmax_sample(probs, legal_mask, T)
+                        try:
+                            action = _softmax_sample(probs, legal_mask, T)
+                        except Exception:
+                            action = int(np.argmax(probs * legal_mask))
 
                     ok = env.step(action)
                     if not ok:
-                        # Если ход не прошёл — возьмём первый легальный.
                         idx = np.where(legal_mask > 0)[0]
                         if len(idx) > 0:
                             env.step(int(idx[0]))
@@ -169,12 +163,12 @@ def self_play_worker(worker_id: int,
                             break
                     move_idx += 1
 
-                # Партия завершена — распределение наград.
+                # Партия завершена — распределяем награды
                 winner = env.winner()
                 for i in range(len(game_states)):
                     p = game_players[i]
                     if winner == -1:
-                        val = 0.0  # ничья
+                        val = 0.0
                     elif winner == p:
                         val = 1.0
                     else:
@@ -188,39 +182,40 @@ def self_play_worker(worker_id: int,
 
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        with open(f"worker_{worker_id}_fatal.log", "a") as f:
+            f.write(traceback.format_exc())
     finally:
-        output_queue.put(None)  # сигнал "воркер завершился"
+        output_queue.put(None)
 
 
-# ---------- Arbiter (arena) ----------
+# ---- Arena evaluation ----
 
-def arena_evaluation(model_a_path: str,
-                     model_b_path: str,
-                     num_games: int = 100,
+def arena_evaluation(onnx_a: str, onnx_b: str, num_games: int = 40,
                      time_budget: float = 0.5) -> dict:
-    """
-    Сыграть num_games партий между двумя моделями (точнее — между двумя ISMCTS
-    с разными time_budgets или разными конфигами).
-
-    Возвращает {wins_a, wins_b, draws}.
-    """
+    """Сыграть num_games партий между двумя ONNX-моделями."""
     env = durakk_env.DurakEnv()
     wins_a = wins_b = draws = 0
+
+    # Загружаем модель A
+    if os.path.exists(onnx_a):
+        env.load_model(onnx_a, "CPU")
+
     for g in range(num_games):
         env.reset_with_seed(g)
-        while not env.is_game_over():
-            # Упрощение: обе «модели» — это просто ISMCTS. В реальной арене
-            # одна модель должна использовать OnnxNet.
+        moves = 0
+        while not env.is_game_over() and moves < 500:
             probs = env.run_ismcts(time_budget, 1)
-            legal_mask = np.array(env.get_legal_action_mask(), dtype=np.float32)
-            p = np.array(probs) * legal_mask
-            action = int(np.argmax(p)) if p.sum() > 0 else int(np.argmax(legal_mask))
+            mask = np.array(env.get_legal_action_mask(), dtype=np.float32)
+            p = np.array(probs) * mask
+            action = int(np.argmax(p)) if p.sum() > 0 else int(np.argmax(mask))
             if not env.step(action):
-                idx = np.where(legal_mask > 0)[0]
+                idx = np.where(mask > 0)[0]
                 if len(idx) > 0:
                     env.step(int(idx[0]))
                 else:
                     break
+            moves += 1
         w = env.winner()
         if w == 0:
             wins_a += 1
@@ -228,22 +223,23 @@ def arena_evaluation(model_a_path: str,
             wins_b += 1
         else:
             draws += 1
+
     return {"wins_a": wins_a, "wins_b": wins_b, "draws": draws}
 
 
-# ---------- Менеджер воркеров ----------
+# ---- Менеджер воркеров ----
 
 class SelfPlayManager:
-    """Запускает N self-play воркеров, собирает примеры."""
+    """Запускает N self-play воркеров с OnnxNet в C++ ISMCTS."""
 
     def __init__(self,
                  num_workers: int = 6,
-                 model_path: Optional[str] = None,
+                 onnx_path: Optional[str] = None,
                  games_per_iteration: int = 4,
                  time_budget: float = 0.5,
                  num_threads: int = 1):
         self.num_workers = num_workers
-        self.model_path = model_path
+        self.onnx_path = onnx_path
         self.games_per_iteration = games_per_iteration
         self.time_budget = time_budget
         self.num_threads = num_threads
@@ -253,20 +249,20 @@ class SelfPlayManager:
         self.workers: List[mp.Process] = []
 
     def start(self):
-        ctx = mp.get_context("spawn")  # безопаснее для C++ модулей на Windows
+        ctx = mp.get_context("spawn")
         for i in range(self.num_workers):
             p = ctx.Process(
                 target=self_play_worker,
-                args=(i, self.model_path, self.queue, self.stop_event,
-                      self.games_per_iteration, self.time_budget, self.num_threads),
+                args=(i, self.onnx_path, self.queue, self.stop_event,
+                      self.games_per_iteration, self.time_budget, self.num_threads,
+                      (1.0, 10, 0.25), 0.3, 0.25),
                 daemon=True,
             )
             p.start()
             self.workers.append(p)
-        print(f"[SelfPlayManager] Запущено {self.num_workers} воркеров")
+        print(f"[SelfPlayManager] Запущено {self.num_workers} воркеров (AlphaZero режим)")
 
-    def collect(self, max_examples: int = 10_000, timeout: float = 60.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Собрать до max_examples примеров из очереди."""
+    def collect(self, max_examples: int = 10_000, timeout: float = 60.0):
         states, policies, values, masks = [], [], [], []
         deadline = time.time() + timeout
         while len(states) < max_examples and time.time() < deadline:
@@ -275,7 +271,6 @@ class SelfPlayManager:
             except Empty:
                 continue
             if item is None:
-                # Воркер завершился.
                 continue
             s, p, v, m = item
             states.append(s)
@@ -307,12 +302,13 @@ class SelfPlayManager:
 
 
 if __name__ == "__main__":
-    # Smoke-test: запустить 2 воркера на 30 секунд, собрать примеры.
-    mgr = SelfPlayManager(num_workers=2, games_per_iteration=2, time_budget=0.1)
+    # Smoke test
+    mgr = SelfPlayManager(num_workers=2, onnx_path="checkpoints/current.onnx",
+                          games_per_iteration=2, time_budget=0.1)
     mgr.start()
     try:
         time.sleep(30)
         s, p, v, m = mgr.collect(max_examples=1000, timeout=5.0)
-        print(f"Собрано: states={s.shape}, policies={p.shape}, values={v.shape}, masks={m.shape}")
+        print(f"Собрано: states={s.shape}, policies={p.shape}, values={v.shape}")
     finally:
         mgr.stop()

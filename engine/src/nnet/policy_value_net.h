@@ -38,6 +38,8 @@ public:
         for (const auto& s : states) out.push_back(evaluate(s, viewpoint));
         return out;
     }
+
+    virtual bool isReady() const { return true; }
 };
 
 // Заглушка — uniform policy, value = 0.5.

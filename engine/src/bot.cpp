@@ -54,7 +54,21 @@ MatchState toMatchState(const GameState& s, const Knowledge& k) {
 
 } // namespace
 
-Bot::Bot() : net_(std::make_unique<RandomNet>()) {}
+Bot::Bot() {
+#ifdef DURAKK_USE_ONNX
+    try {
+        net_ = std::make_unique<OnnxNet>("checkpoints/model.onnx", "CUDA", 0);
+    } catch (...) {
+        try {
+            net_ = std::make_unique<OnnxNet>("checkpoints/model.onnx", "CPU", 0);
+        } catch (...) {
+            net_ = std::make_unique<RandomNet>();
+        }
+    }
+#else
+    net_ = std::make_unique<RandomNet>();
+#endif
+}
 
 Move Bot::decide(const GameState& s, const Knowledge& k,
                  const SearchSettings& settings, DecisionStats* statsOut) {
@@ -95,7 +109,7 @@ Move Bot::decide(const GameState& s, const Knowledge& k,
     IsmctsLimits lim;
     lim.timeBudgetSec = timeoutFor(settings.strength);
     lim.numThreads = settings.numThreads;
-    IsmctsResult r = runIsmcts(root, k, lim, nullptr, Player::Me);
+    IsmctsResult r = runIsmcts(root, k, lim, nullptr, Player::Me, net_.get());
 
     stats.mode = "ISMCTS";
     stats.playouts = r.playouts;
