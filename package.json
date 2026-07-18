@@ -1,0 +1,16 @@
+{
+  "name": "durakk-helper",
+  "version": "0.1.0",
+  "description": "Помощник для переводного дурака онлайн: C++ движок-советник + Electron UI с ручным вводом состояния игры",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build:engine": "node scripts/build-engine.js",
+    "build:engine:clean": "node scripts/build-engine.js --clean"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^32.0.0"
+  }
+}

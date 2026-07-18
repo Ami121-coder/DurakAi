@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; style-src 'self' 'unsafe-inline';" />
+    <title>Помощник: переводной дурак онлайн</title>
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <header class="topbar">
+        <h1>🃏 Дурак-онлайн · помощник</h1>
+        <div id="engineStatus" class="badge badge--unknown">движок: проверка…</div>
+    </header>
+
+    <main class="layout">
+        <!-- ===================== ВВОД СОСТОЯНИЯ ===================== -->
+        <section class="panel panel--input">
+            <h2>Состояние игры</h2>
+
+            <div class="field-row">
+                <label>Козырь:</label>
+                <div id="trumpPicker" class="suit-picker"></div>
+                <label class="check">
+                    <input type="checkbox" id="transferEnabled" checked /> Переводной
+                </label>
+                <label class="check">
+                    <input type="checkbox" id="flashEnabled" /> Проездной
+                </label>
+            </div>
+
+            <div class="field-row">
+                <label>Колода (ост.):
+                    <input type="number" id="deckCount" min="0" max="36" value="0" />
+                </label>
+                <label>Карт у соперника:
+                    <input type="number" id="oppHandCount" min="0" max="36" value="0" />
+                </label>
+                <label>Фаза:
+                    <select id="phase">
+                        <option value="attack">атака</option>
+                        <option value="defense">защита</option>
+                    </select>
+                </label>
+                <label>Чей ход:
+                    <select id="turn">
+                        <option value="me">я</option>
+                        <option value="opp">соперник</option>
+                    </select>
+                </label>
+                <label>Атакующий:
+                    <select id="attacker">
+                        <option value="me">я</option>
+                        <option value="opp">соперник</option>
+                    </select>
+                </label>
+                <label class="check">
+                    <input type="checkbox" id="firstTrick" checked /> Первый кон
+                </label>
+            </div>
+
+            <h3>Моя рука</h3>
+            <div id="handGrid" class="card-grid"></div>
+
+            <h3>Стол</h3>
+            <div id="tableGrid" class="card-grid card-grid--table"></div>
+            <div class="field-row">
+                <button id="addTablePair" type="button">＋ пара на стол</button>
+                <button id="clearTable" type="button">очистить стол</button>
+            </div>
+
+            <div class="actions">
+                <button id="btnDecide" class="btn btn--primary">💡 Получить совет</button>
+                <button id="btnLegal" class="btn">📜 Легальные ходы</button>
+                <button id="btnReset" class="btn btn--ghost">↺ Сброс</button>
+            </div>
+
+            <h3>Память бота (абсолютная)</h3>
+            <p class="hint">Карты, ушедшие в отбой, и карты, которые соперник забрал со стола.</p>
+            <div class="mem-row">
+                <div>
+                    <label>Карты в бите:</label>
+                    <div id="discardGrid" class="card-grid card-grid--small"></div>
+                </div>
+                <div>
+                    <label>Соперник забрал:</label>
+                    <div id="oppTakenGrid" class="card-grid card-grid--small"></div>
+                </div>
+            </div>
+
+            <h3>Сила ИИ</h3>
+            <div class="strength-row">
+                <button class="btn strength-btn" data-strength="fast">⚡ Быстро</button>
+                <button class="btn strength-btn strength-btn--active" data-strength="normal">🧠 Норма</button>
+                <button class="btn strength-btn" data-strength="deep">🔬 Глубоко</button>
+            </div>
+        </section>
+
+        <!-- ===================== ВЫВОД БОТА ===================== -->
+        <section class="panel panel--output">
+            <h2>Совет бота</h2>
+            <div id="advice" class="advice advice--empty">
+                Заполните состояние и нажмите «Получить совет».
+            </div>
+
+            <h3>Легальные ходы</h3>
+            <div id="legalList" class="legal-list">—</div>
+
+            <details class="json-details">
+                <summary>Последний запрос (JSON)</summary>
+                <pre id="lastRequest"></pre>
+                <summary>Последний ответ (JSON)</summary>
+                <pre id="lastResponse"></pre>
+            </details>
+        </section>
+    </main>
+
+    <script src="renderer.js"></script>
+</body>
+</html>

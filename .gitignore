@@ -1,0 +1,34 @@
+# Node / Electron
+node_modules/
+dist/
+out/
+
+# C++ сборка
+engine/build/
+engine/dist/
+build/
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+
+# Логи и локальные файлы
+*.log
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# AI training data
+checkpoints/
+runs/
+*.pt
