@@ -198,21 +198,10 @@ void addDirichletToRoot(Tree& tree, double alpha, double eps) {
     }
 }
 
-// ---- FIX #4: оценим узел сетью и сохраним priors для детей ----
-void evaluateNodeWithNet(Tree& tree, int nodeIdx, PolicyValueNet* net,
-                          const MatchState& nodeState, Player viewpoint) {
-    if (!net || tree.nodes[nodeIdx].evaluated) return;
-
-    PVResult pv = net->evaluate(nodeState, viewpoint);
-    tree.nodes[nodeIdx].evaluated = true;
-    tree.nodes[nodeIdx].cachedValue = pv.value;
-
-    // Сохраним priors для будущих расширений детей.
-    auto& childPriors = tree.nodes[nodeIdx].childPriors;
-    for (auto& [mv, prior] : pv.policy) {
-        childPriors[mv] = prior;
-    }
-}
+// ---- FIX #16: убрана неиспользуемая функция evaluateNodeWithNet ----
+// Она была объявлена, но нигде не вызывалась — сеть для листьев
+// вызывается инлайн в worker-ламбде ниже. Мёртвый код удалён, чтобы
+// не сбивать с толку.
 
 } // namespace
 
@@ -297,11 +286,9 @@ IsmctsResult runIsmcts(const MatchState& rootState, const Knowledge& knowledge,
                     std::lock_guard<std::mutex> lk(tree.mtx);
                     Node& node = tree.nodes[cur];
 
-                    // Если узел ещё не оценён сетью — оценим.
-                    if (net && !node.evaluated && cur != 0) {
-                        // Оценим после release лока — см. ниже.
-                        // Здесь только отметим, что нужно оценить.
-                    }
+                    // FIX #17: убран пустой if (net && !node.evaluated && cur != 0)
+                    // — тело было пустым, никакого эффекта. Листья оцениваются
+                    // сетью при расширении (см. ниже в doExpand ветке).
 
                     for (int i = 0; i < n; ++i) {
                         if (node.expandedMoves.find(buf[i]) == node.expandedMoves.end()) {

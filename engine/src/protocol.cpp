@@ -93,13 +93,19 @@ static Phase phaseFromString(const std::string& s) {
     if (s == "attack") return Phase::Attack;
     if (s == "defense") return Phase::Defense;
     if (s == "done") return Phase::Done;
+    // Phase::Pursue используется только внутри симулятора (MatchPhase),
+    // в JSON-протоколе внешней фазы нет — перевод делается автоматически.
     throw std::runtime_error("unknown phase: " + s);
 }
 
 static DeckSize deckSizeFromInt(int n) {
     switch (n) {
         case 24: return DeckSize::Cards24;
-        case 52: return DeckSize::Cards52;
+        case 52:
+            // FIX #12: 52-карточная колода не реализована.
+            throw std::runtime_error(
+                "52-карточная колода не поддерживается (используйте 36 или 24). "
+                "См. engine/src/deck.cpp::fullDeck.");
         case 36: default: return DeckSize::Cards36;
     }
 }

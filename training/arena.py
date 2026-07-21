@@ -399,14 +399,22 @@ class ArenaEvaluator:
 
 
 # ============================================================================
-# Внешний baseline evaluator: против фиксированного RandomNet-ISMCTS.
+# Внешний baseline evaluator: против фиксированного pure-MCTS (без нейросети).
 # Эта метрика — ИСТИННЫЙ показатель прогресса.
 # ============================================================================
 
 class ExternalBaselineEvaluator:
     """
     Оценивает current.onnx против фиксированного внешнего baseline:
-      - RandomNet-ISMCTS (чистый search без нейросети).
+      - чистый MCTS без нейросети (UCB1 + rollout).
+
+    FIX #15: в комментарии было «vs RandomNet-ISMCTS», но DurakEnv без модели
+    использует НЕ RandomNet, а чистый MCTS (UCB1 + rollout) — потому что в
+    bot.cpp при отсутствии сети передаётся nullptr и ISMCTS идёт по
+    математическому пути без priors/value. RandomNet — это отдельный класс
+    (равномерные priors + value=0.5), который в этом пайплайне не используется.
+    Названия метрик в TensorBoard сохранены для обратной совместимости, но
+    в логах и комментариях теперь корректно указано «pure-MCTS».
 
     Это правильная метрика прогресса: всегда сравниваем с одним и тем же
     слабым противником. Если winrate растёт — модель становится сильнее.
@@ -441,7 +449,7 @@ class ExternalBaselineEvaluator:
                       f"{self.onnx_path}")
 
     def evaluate_vs_random_ismcts(self) -> dict:
-        """current vs RandomNet-ISMCTS."""
+        """current vs pure-MCTS (без нейросети)."""
         self._ensure_worker()
 
         wins = losses = draws = 0

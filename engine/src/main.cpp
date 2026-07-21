@@ -23,6 +23,18 @@ json error(const std::string& msg) {
     return {{"ok", false}, {"error", msg}};
 }
 
+// FIX #1 (критический): Electron-bridge отправляет запросы с полем "_id"
+// и сопоставляет ответ по нему. Раньше C++ вообще не возвращал _id —
+// любой запрос висел до таймаута (5 сек) и отвергался.
+// Теперь: если во входящем JSON есть _id (любого типа), мы echo-им его
+// в ответ. Это делает протокол request/response надёжным.
+json wrapWithId(const json& req, json response) {
+    if (req.contains("_id")) {
+        response["_id"] = req["_id"];
+    }
+    return response;
+}
+
 json handle(const json& req, GameState& state, Knowledge& knowledge, Bot& bot) {
     if (!req.contains("cmd"))
         return error("missing 'cmd'");
@@ -104,10 +116,19 @@ int main() {
         if (line.empty()) continue;
         try {
             durakk::json req = durakk::json::parse(line);
-            durakk::json res = durakk::handle(req, state, knowledge, bot);
+            // FIX #1: любое исключение внутри handle не должно ронять движок,
+            // а _id обязан пройти даже в случае ошибки — иначе клиент зависнет.
+            durakk::json res;
+            try {
+                res = durakk::handle(req, state, knowledge, bot);
+            } catch (const std::exception& e) {
+                res = durakk::error(std::string("exception: ") + e.what());
+            }
+            res = durakk::wrapWithId(req, std::move(res));
             durakk::reply(res);
         } catch (const std::exception& e) {
-            durakk::reply(durakk::error(std::string("exception: ") + e.what()));
+            // Сам JSON не распарсился — _id взять неоткуда. Просто рапортуем.
+            durakk::reply(durakk::error(std::string("parse error: ") + e.what()));
         }
     }
     return 0;

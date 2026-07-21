@@ -31,7 +31,9 @@ int MatchState::countRankOnTable(Rank r) const {
 }
 
 int MatchState::pairsHeadroom() const {
-    int byRules = firstTrick ? 5 : pairsLimit; // первый кон — 5, иначе pairsLimit(6)
+    // FIX #7, #18: используем pairsLimit (пробрасывается из GameState.firstTrickLimit
+    // для первого кона через toMatchState) вместо хардкода 5/6.
+    int byRules = firstTrick ? std::min(pairsLimit, 5) : pairsLimit;
     int defHand = popCount(hands[toIdx(defender())]);
     return std::min(byRules, defHand) - tableLen;
 }
@@ -101,22 +103,35 @@ bool applyMove(MatchState& s, const Move& m) {
 
     switch (m.action) {
 
-    // ---------- Атака / подкидывание ----------
+    // ---------- Атака / подкидывание / вдогонку ----------
     case Action::Attack:
     case Action::Toss: {
-        if (s.phase != MatchPhase::Attack) return false;
+        // Подкидывание «вдогонку» разрешено в фазе Pursue (после «беру»),
+        // обычное подкидывание — в фазе Attack.
+        if (s.phase != MatchPhase::Attack && s.phase != MatchPhase::Pursue) return false;
         if (s.turn != s.attacker) return false;
         if (!maskHas(s.hands[toIdx(me)], m.card)) return false;
 
         if (s.tableLen > 0) {
             if (s.countRankOnTable(m.card.rank) == 0) return false;
-            if (s.pairsHeadroom() <= 0) return false;
+            // Лимит по руке защитника (будущего взявшего в Pursue).
+            int defHand = popCount(s.hands[toIdx(s.defender())]);
+            int byRules = s.firstTrick ? 5 : s.pairsLimit;
+            int maxPairs = std::min(byRules, defHand);
+            if (s.tableLen >= maxPairs) return false;
         }
 
         s.hands[toIdx(me)] = maskRemove(s.hands[toIdx(me)], m.card);
         s.table[s.tableLen++] = Pair{ m.card, Card{}, false };
-        s.turn = s.defender();
-        s.phase = MatchPhase::Defense;
+
+        if (s.phase == MatchPhase::Pursue) {
+            // В Pursue фаза не меняется — атакующий может подкидывать дальше
+            // или завершить через Pass.
+            s.turn = s.attacker;
+        } else {
+            s.turn = s.defender();
+            s.phase = MatchPhase::Defense;
+        }
         return true;
     }
 
@@ -160,7 +175,10 @@ bool applyMove(MatchState& s, const Move& m) {
         int newDefHand = popCount(s.hands[toIdx(s.attacker)]);
         int cardsAfter = s.undefendedCount() + 1;
         if (newDefHand < cardsAfter) return false;
-        if (s.pairsHeadroom() <= 0) return false;
+        // FIX #8: лимит пар по руке НОВОГО защитника (бывшего атакующего).
+        int byRules = s.firstTrick ? std::min(s.pairsLimit, 5) : s.pairsLimit;
+        int maxPairs = std::min(byRules, newDefHand);
+        if (s.tableLen >= maxPairs) return false;
 
         s.hands[toIdx(me)] = maskRemove(s.hands[toIdx(me)], m.card);
         s.table[s.tableLen++] = Pair{ m.card, Card{}, false };
@@ -179,19 +197,15 @@ bool applyMove(MatchState& s, const Move& m) {
         if (s.turn != s.defender()) return false;
         if (s.tableLen == 0) return false;
 
-        // Взявший забирает стол. Ход остаётся у атакующего; он начинает новый кон.
-        Player taker = s.defender();
-        Player attackSide = s.attacker;
-        s.takeTableToHand(taker);
-
-        s.firstTrick = false;
-        s.phase = MatchPhase::Attack;
-        s.turn = attackSide;
-        s.attacker = attackSide;
-        // Добор: первым берёт атакующий, затем — взявший (защищавшийся).
-        doRefill(attackSide, taker);
-
-        if (s.isGameOver()) s.phase = MatchPhase::GameOver;
+        // FIX #5: правильная последовательность «Беру»:
+        //   1. Защитник объявляет «беру», но НЕ забирает карты сразу.
+        //   2. Фаза переходит в Pursue — атакующий может подкинуть «вдогонку»
+        //      (ранги со стола, лимит по руке защитника).
+        //   3. Завершение кона происходит через Action::Pass из фазы Pursue.
+        // Раньше стол сразу уходил в руку защитника, что нарушало правило
+        // о подкидывании «вдогонку» (см. docs/rules.md §7).
+        s.phase = MatchPhase::Pursue;
+        s.turn = s.attacker;  // ход переходит к атакующему для подкидывания
         return true;
     }
 
@@ -199,7 +213,27 @@ bool applyMove(MatchState& s, const Move& m) {
     case Action::Done:
     case Action::Pass: {
         if (s.tableLen == 0) return false; // нечего завершать
+
+        // В фазе Pursue (после «беру») Pass/Done завершает кон со взятием.
+        if (s.phase == MatchPhase::Pursue) {
+            // Take-сценарий: защитник забирает весь стол.
+            Player taker = s.defender();
+            Player attackSide = s.attacker;
+            s.takeTableToHand(taker);
+            s.firstTrick = false;
+            s.phase = MatchPhase::Attack;
+            s.turn = attackSide;
+            s.attacker = attackSide;
+            // Добор: первым берёт атакующий, затем — взявший.
+            doRefill(attackSide, taker);
+            if (s.isGameOver()) s.phase = MatchPhase::GameOver;
+            return true;
+        }
+
+        // Обычный «бито»: только если все атаки побиты.
         if (m.action == Action::Done && s.undefendedCount() > 0) return false;
+        // Pass без «бито» — только если есть побитые пары и нет непобитых атак.
+        if (m.action == Action::Pass && s.undefendedCount() > 0) return false;
 
         Player exAttacker = s.attacker;     // кто атаковал в этом коне (добирает первым)
         Player exDefender = s.defender();   // кто защищался

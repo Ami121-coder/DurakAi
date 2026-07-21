@@ -50,13 +50,15 @@ int genAttackMoves(const MatchState& s, MoveBuffer& buf, bool* doneOut) {
     int n = 0;
     if (doneOut) *doneOut = false;
 
-    if (s.phase != MatchPhase::Attack || s.turn != s.attacker) return 0;
+    // Подкидывание работает и в фазе Attack, и в фазе Pursue (вдогонку).
+    if (s.phase != MatchPhase::Attack && s.phase != MatchPhase::Pursue) return 0;
+    if (s.turn != s.attacker) return 0;
 
     const CardMask hand = s.hands[toIdx(s.attacker)];
     int headroom = s.pairsHeadroom();
 
     if (s.tableLen == 0) {
-        // Первая карта кона — любая из руки.
+        // Первая карта кона — любая из руки (фаза Attack только).
         CardMask h = hand;
         while (h) {
             CardMask bit = h & (~h + 1);
@@ -73,10 +75,10 @@ int genAttackMoves(const MatchState& s, MoveBuffer& buf, bool* doneOut) {
     }
 
     // Подкидывание: ранги уже на столе; не больше headroom пар.
-    // Замечание: мы генерируем кандидатов, оставляя контроль лимита applyMove'у;
-    // но чтобы не плодить лишние ходы, учтём headroom по числу пар.
     if (headroom <= 0) {
         if (doneOut) *doneOut = (s.undefendedCount() == 0);
+        // В Pursue всегда можно завершить (Pass) — flag вернёт true ниже.
+        if (doneOut && s.phase == MatchPhase::Pursue) *doneOut = true;
         return 0;
     }
     CardMask candidates = rankOnTableMask(s, hand);
@@ -92,8 +94,14 @@ int genAttackMoves(const MatchState& s, MoveBuffer& buf, bool* doneOut) {
 #endif
         pushMove(buf, n, Action::Toss, indexToCard(idx));
     }
-    // Готово «бито», если все побито.
-    if (doneOut) *doneOut = (s.undefendedCount() == 0);
+    // Готово «бито» (или завершение взятия), если все побито ИЛИ мы в Pursue.
+    if (doneOut) {
+        if (s.phase == MatchPhase::Pursue) {
+            *doneOut = true;  // всегда можно завершить взятие через Pass
+        } else {
+            *doneOut = (s.undefendedCount() == 0);
+        }
+    }
     return n;
 }
 
@@ -147,7 +155,10 @@ int genDefenseMoves(const MatchState& s, MoveBuffer& buf) {
                     // Проверим лимит по руке нового защищающегося (бывшего атакующего).
                     int newDefHand = popCount(s.hands[toIdx(s.attacker)]);
                     int cardsAfter = s.undefendedCount() + 1;
-                    if (newDefHand >= cardsAfter && s.pairsHeadroom() > 0) {
+                    // FIX #8: лимит пар по руке НОВОГО защитника.
+                    int byRules = s.firstTrick ? std::min(s.pairsLimit, 5) : s.pairsLimit;
+                    int maxPairs = std::min(byRules, newDefHand);
+                    if (newDefHand >= cardsAfter && s.tableLen < maxPairs) {
                         pushMove(buf, n, Action::Transfer, c);
                     }
                 }
@@ -163,11 +174,15 @@ int genDefenseMoves(const MatchState& s, MoveBuffer& buf) {
 }
 
 int genLegalMoves(const MatchState& s, MoveBuffer& buf) {
-    if (s.phase == MatchPhase::Attack) {
+    if (s.phase == MatchPhase::Attack || s.phase == MatchPhase::Pursue) {
         bool doneOk = false;
         int n = genAttackMoves(s, buf, &doneOk);
         if (doneOk && n < kMaxMoves) {
-            buf[n++] = Move{ Action::Done, Card{}, Card{}, false, {} };
+            // В Pursue используем Pass как индикатор завершения взятия.
+            // В Attack — Done как «бито».
+            buf[n++] = Move{ (s.phase == MatchPhase::Pursue)
+                             ? Action::Pass : Action::Done,
+                             Card{}, Card{}, false, {} };
         }
         return n;
     }

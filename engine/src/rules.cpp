@@ -112,9 +112,14 @@ ValidationResult validateTransfer(const GameState& s, const Move& m) {
     if (newDefenderHand < cardsAfterTransfer)
         return {false, "у соперника меньше карт, чем потребуется отбить после перевода"};
 
-    // Лимит пар тоже должен соблюдаться.
-    if (pairsHeadroom(s) <= 0)
-        return {false, "превышен лимит пар в коне"};
+    // FIX #8: лимит пар проверяем по руке НОВОГО защитника, а не текущего.
+    // Раньше pairsHeadroom() считал по s.opposite(s.attacker) = текущему
+    // защитнику (тому, кто переводит). Логически неверно: после перевода
+    // отбиваться будет бывший атакующий, лимит должен быть по его руке.
+    int byRules = s.firstTrick ? s.firstTrickLimit : 6;
+    int maxPairs = std::min(byRules, newDefenderHand);
+    if (s.pairsCount() >= maxPairs)
+        return {false, "превышен лимит пар в коне после перевода"};
 
     return {true, ""};
 }
@@ -156,11 +161,31 @@ ValidationResult validateTake(const GameState& s, const Move& /*m*/) {
 ValidationResult validateDone(const GameState& s, const Move& /*m*/) {
     if (s.table.empty())
         return {false, "кон ещё не начался"};
-    // «Бито» может объявить атакующий, когда все атаки побиты и он не подкидывает.
-    if (s.undefendedAttacksCount() > 0 && s.phase == Phase::Defense)
+    // «Бито» объявляет атакующий в фазе Attack, когда все атаки побиты
+    // и он добровольно завершает кон.
+    if (s.phase != Phase::Attack)
+        return {false, "бито может объявить только атакующий в фазе атаки"};
+    if (s.turn != s.attacker)
+        return {false, "бито объявляет атакующий"};
+    if (s.undefendedAttacksCount() > 0)
         return {false, "есть непобитые атаки — защищающийся должен отбиться или взять"};
-    // Также «бито» корректно после полной защиты, фаза уже Attack у атакующего —
-    // тогда он добровольно завершает кон.
+    return {true, ""};
+}
+
+// ============================ Pass (отказ от подкидывания) ============================
+
+ValidationResult validatePass(const GameState& s, const Move& /*m*/) {
+    // Pass — отказ от дальнейшего подкидывания. Легален ТОЛЬКО в фазе Attack
+    // со стороны атакующего, когда на столе есть побитые пары (либо все побито,
+    // что эквивалентно Done). Раньше возвращали {true, ""} без проверок —
+    // это позволяло «завершить кон» через Pass даже в защите с непобитыми
+    // атаками, что applyMove превращал в сброс стола как «бито».
+    if (s.phase != Phase::Attack)
+        return {false, "pass возможен только в фазе атаки"};
+    if (s.turn != s.attacker)
+        return {false, "pass делает атакующий"};
+    if (s.table.empty())
+        return {false, "нечего завершать (стол пуст)"};
     return {true, ""};
 }
 
@@ -174,7 +199,7 @@ ValidationResult validateMove(const GameState& s, const Move& m) {
         case Action::Toss:     return validateToss(s, m);
         case Action::Take:     return validateTake(s, m);
         case Action::Done:     return validateDone(s, m);
-        case Action::Pass:     return {true, ""}; // Pass — отказ от подкидывания
+        case Action::Pass:     return validatePass(s, m);
     }
     return {false, "неизвестное действие"};
 }
@@ -228,7 +253,10 @@ std::vector<Card> legalTransferCards(const GameState& s) {
         : s.oppHandCount;
     int cardsAfterTransfer = s.undefendedAttacksCount() + 1;
     if (newDefenderHand < cardsAfterTransfer) return out;
-    if (pairsHeadroom(s) <= 0) return out;
+    // FIX #8: лимит пар по руке НОВОГО защитника.
+    int byRules = s.firstTrick ? s.firstTrickLimit : 6;
+    int maxPairs = std::min(byRules, newDefenderHand);
+    if (s.pairsCount() >= maxPairs) return out;
 
     for (const Card& c : s.myHand) {
         if (c.rank == topRank) out.push_back(c);

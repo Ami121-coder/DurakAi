@@ -106,9 +106,13 @@
             <h3>Легальные ходы</h3>
             <div id="legalList" class="legal-list">—</div>
 
+            <!-- FIX #22: два <summary> в одном <details> — невалидный HTML.
+                 Разделили на два отдельных <details>. -->
             <details class="json-details">
                 <summary>Последний запрос (JSON)</summary>
                 <pre id="lastRequest"></pre>
+            </details>
+            <details class="json-details">
                 <summary>Последний ответ (JSON)</summary>
                 <pre id="lastResponse"></pre>
             </details>

@@ -133,7 +133,12 @@ class EngineBridge extends EventEmitter {
 
     // Удобные обёртки под протокол.
     async setState(state)  { return this.request('setState', state); }
-    async decide(opts = {})  { return this.request('decide', opts); }
+    // FIX #11: decide принимает opts (включая strength) и пробрасывает в payload.
+    async decide(opts = {})  {
+        const payload = {};
+        if (opts && opts.strength) payload.strength = opts.strength;
+        return this.request('decide', payload);
+    }
     async legalMoves()     { return this.request('legalMoves'); }
     async validate(action) { return this.request('validate', action); }
 

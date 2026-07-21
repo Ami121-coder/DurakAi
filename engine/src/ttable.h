@@ -17,6 +17,9 @@
 namespace durakk {
 
 // Zobrist-хеш позиции. Заполняется incrementally не (пока) — здесь простой полный пересчёт.
+// FIX #9: учитывает firstTrick, transferEnabled, flashEnabled, pairsLimit,
+// deckRemaining, а также порядок пар (через позиционный индекс) — иначе
+// разные позиции давали одинаковый хеш и TT возвращал ошибочные оценки.
 uint64_t computeHash(const MatchState& s);
 
 // Запись в таблице перестановок.

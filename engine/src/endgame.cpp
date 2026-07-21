@@ -1,5 +1,7 @@
 #include "endgame.h"
 #include "rules_fast.h"
+#include "bitboard.h"
+#include "card.h"
 
 #include <algorithm>
 #include <chrono>
@@ -46,7 +48,22 @@ int negamax(MatchState& s, int depth, int alpha, int beta, SearchCtx& ctx) {
         return 0; // ничья
     }
 
-    if (depth <= 0 || ctx.timeUp()) return 0; // не решено в пределах глубины
+    if (depth <= 0 || ctx.timeUp()) {
+        // FIX #14: возврат 0 трактовался как «ничья», что искажало α-β
+        // на обрезанных поддеревьях. Возвращаем простую эвристику:
+        // разница рук со знаком текущего игрока. Козырь учитывается ×2.
+        int myIdx = toIdx(s.turn);
+        int myCards = popCount(s.hands[myIdx]);
+        int oppCards = popCount(s.hands[1 - myIdx]);
+        // Лёгкая поправка: козыри ценнее.
+        CardMask trumpMask = 0;
+        for (int r = 6; r <= 14; ++r)
+            trumpMask |= cardBit(Card{static_cast<Rank>(r), s.trump});
+        int myTrumps = popCount(s.hands[myIdx] & trumpMask);
+        int oppTrumps = popCount(s.hands[1 - myIdx] & trumpMask);
+        int heuristic = (oppCards - myCards) * 10 + (oppTrumps - myTrumps) * 4;
+        return heuristic;
+    }
 
     // Заглянем в TT.
     uint64_t key = computeHash(s);
@@ -68,11 +85,18 @@ int negamax(MatchState& s, int depth, int alpha, int beta, SearchCtx& ctx) {
     if (n == 0) return 0;
 
     // Упорядочивание: TT-best ход первым.
+    // FIX #13: в старом коде цикл с break на i=0 просто менял buf[0] с buf[0]
+    // местами — упорядочивание не работало. Теперь ищем TT-best ход в списке
+    // и ставим его на первую позицию.
     if (e && e->hasBest) {
         for (int i = 0; i < n; ++i) {
-            // Простой обмен с нулевой позицией.
-            Move tmp = buf[0]; buf[0] = buf[i]; buf[i] = tmp;
-            break;
+            if (buf[i].action == e->best.action &&
+                buf[i].card == e->best.card &&
+                buf[i].hasTarget == e->best.hasTarget &&
+                (!buf[i].hasTarget || buf[i].target == e->best.target)) {
+                if (i != 0) std::swap(buf[0], buf[i]);
+                break;
+            }
         }
     }
 

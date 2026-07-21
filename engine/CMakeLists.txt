@@ -30,15 +30,49 @@ endif()
 find_package(Threads REQUIRED)
 
 # ---- ONNX Runtime ----
+# FIX #3: путь к ONNX Runtime больше не захардкожен под машину разработчика.
+# Теперь он берётся из переменной окружения ONNXRUNTIME_ROOT (или cmake -DONNXRUNTIME_ROOT=...),
+# либо из стандартных мест установки. Если не найден — сборка продолжается
+# без ONNX (DURAKK_USE_ONNX=OFF), бот работает в режиме чистой математики.
 if(DURAKK_USE_ONNX)
-    set(ONNX_ROOT "C:/Users/danas/Desktop/onnxruntime/onnxruntime-win-x64-1.17.1")
-    find_library(ONNXRUNTIME_LIB onnxruntime PATHS "${ONNX_ROOT}/lib")
-    find_path(ONNXRUNTIME_INCLUDE onnxruntime_cxx_api.h PATHS "${ONNX_ROOT}/include")
-    
+    if(NOT DEFINED ONNXRUNTIME_ROOT)
+        if(DEFINED ENV{ONNXRUNTIME_ROOT})
+            set(ONNXRUNTIME_ROOT $ENV{ONNXRUNTIME_ROOT})
+        elseif(WIN32)
+            set(ONNXRUNTIME_ROOT "C:/onnxruntime" CACHE PATH "Path to ONNX Runtime SDK")
+        else()
+            set(ONNXRUNTIME_ROOT "/usr/local/onnxruntime" CACHE PATH "Path to ONNX Runtime SDK")
+        endif()
+    endif()
+
+    find_library(ONNXRUNTIME_LIB onnxruntime
+                 PATHS "${ONNXRUNTIME_ROOT}/lib"
+                       "${ONNXRUNTIME_ROOT}/lib64"
+                       /usr/lib
+                       /usr/local/lib
+                       /usr/lib/x86_64-linux-gnu
+                 NO_DEFAULT_PATH)
+    find_path(ONNXRUNTIME_INCLUDE onnxruntime_cxx_api.h
+              PATHS "${ONNXRUNTIME_ROOT}/include"
+                    /usr/include
+                    /usr/local/include
+              NO_DEFAULT_PATH)
+
+    # Если не нашли в ONNXRUNTIME_ROOT — попробовать системный поиск.
+    if(NOT ONNXRUNTIME_LIB OR NOT ONNXRUNTIME_INCLUDE)
+        find_library(ONNXRUNTIME_LIB onnxruntime)
+        find_path(ONNXRUNTIME_INCLUDE onnxruntime_cxx_api.h)
+    endif()
+
     if(ONNXRUNTIME_LIB AND ONNXRUNTIME_INCLUDE)
-        message(STATUS "Found ONNX Runtime: ${ONNXRUNTIME_LIB}")
+        message(STATUS "Found ONNX Runtime: ${ONNXRUNTIME_LIB} (include: ${ONNXRUNTIME_INCLUDE})")
     else()
-        message(WARNING "ONNX Runtime не найден в ${ONNX_ROOT} — OnnxNet будет заглушкой.")
+        message(WARNING
+            "ONNX Runtime не найден.\n"
+            "Установите его или укажите путь:\n"
+            "  -D ONNXRUNTIME_ROOT=/path/to/onnxruntime\n"
+            "или через переменную окружения ONNXRUNTIME_ROOT.\n"
+            "Сборка продолжится БЕЗ ONNX (бот работает в режиме чистой математики).")
         set(DURAKK_USE_ONNX OFF)
     endif()
 endif()
@@ -137,15 +171,22 @@ add_custom_command(TARGET durakk_env POST_BUILD
 )
 
 if(DURAKK_USE_ONNX AND ONNXRUNTIME_LIB)
+    # FIX #3: копируем onnxruntime.dll рядом с exe, если она есть.
+    # Раньше путь был захардкожен. Теперь ищем относительно найденной либы.
+    get_filename_component(_ONNX_LIB_DIR "${ONNXRUNTIME_LIB}" DIRECTORY)
     add_custom_command(TARGET durakk_env POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${ONNX_ROOT}/lib/onnxruntime.dll"
-            ${CMAKE_CURRENT_SOURCE_DIR}/../onnxruntime.dll
+            "${_ONNX_LIB_DIR}/$<IF:$<BOOL:${WIN32}>,onnxruntime.dll,libonnxruntime.so>"
+            ${CMAKE_CURRENT_SOURCE_DIR}/../$<IF:$<BOOL:${WIN32}>,onnxruntime.dll,libonnxruntime.so>
+        COMMAND_EXPAND_LISTS
+        VERBATIM
     )
-    
+
     add_custom_command(TARGET durakk_engine POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${ONNX_ROOT}/lib/onnxruntime.dll"
+            "${_ONNX_LIB_DIR}/$<IF:$<BOOL:${WIN32}>,onnxruntime.dll,libonnxruntime.so>"
             $<TARGET_FILE_DIR:durakk_engine>
+        COMMAND_EXPAND_LISTS
+        VERBATIM
     )
 endif()

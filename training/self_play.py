@@ -144,6 +144,10 @@ def self_play_worker(worker_id: int,
     try:
         games_played = 0
         positions_generated = 0
+        # FIX #20: раньше переменная t0_game была привязана к старту одной игры,
+        # а elapsed считался с багом (60.0 захардкожено). Теперь ведём честный
+        # отсчёт от старта воркера.
+        t0_worker = time.time()
 
         while not stop_event.is_set():
             for game_idx in range(games_per_iteration):
@@ -235,9 +239,10 @@ def self_play_worker(worker_id: int,
             # Периодический отчёт.
             if worker_id == 0 and games_played > 0 and \
                games_played % 10 == 0:
-                elapsed = time.time() - t0_game if games_played == 1 else 60.0
+                elapsed = time.time() - t0_worker
                 print(f"[Worker {worker_id}] {games_played} партий, "
-                      f"{positions_generated} позиций", flush=True)
+                      f"{positions_generated} позиций, "
+                      f"elapsed={elapsed:.0f}s", flush=True)
 
     except KeyboardInterrupt:
         pass

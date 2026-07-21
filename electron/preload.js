@@ -6,10 +6,13 @@ const { contextBridge, ipcRenderer } = require('electron');
 // на статус движка. contextIsolation включён, nodeIntegration выключен.
 contextBridge.exposeInMainWorld('bot', {
     // state — объект состояния игры в формате движка (см. protocol.h).
-    decide: (state)         => ipcRenderer.invoke('bot:decide', state),
-    legalMoves: (state)     => ipcRenderer.invoke('bot:legalMoves', state),
-    validate: (state, action) => ipcRenderer.invoke('bot:validate', state, action),
-    status: ()              => ipcRenderer.invoke('engine:status'),
+    // opts  — опциональный объект { strength: 'fast'|'normal'|'deep' }.
+    // FIX #11: раньше opts не пробрасывался, и выбор силы в UI не влиял
+    // на поведение бота (всегда использовался Normal).
+    decide: (state, opts)       => ipcRenderer.invoke('bot:decide', state, opts),
+    legalMoves: (state)         => ipcRenderer.invoke('bot:legalMoves', state),
+    validate: (state, action)   => ipcRenderer.invoke('bot:validate', state, action),
+    status: ()                  => ipcRenderer.invoke('engine:status'),
     onStatus: (cb) => {
         const handler = (_e, info) => cb(info);
         ipcRenderer.on('engine:status', handler);

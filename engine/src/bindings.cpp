@@ -253,12 +253,15 @@ public:
     }
 
     py::array_t<float> run_ismcts(double time_budget, int num_threads) {
-        // FIX (viewpoint bug): viewpoint должен быть Player::Me ВСЕГДА,
-        // независимо от того, чей сейчас ход. Старый код ставил vp=currentPlayer(),
-        // что означало: когда ходит соперник, ISMCTS maximise ДЛЯ СОПЕРНИКА —
-        // бот отдавал лучшие ходы оппоненту и всегда брал Take (для "выигрыша" Opp).
-        // Теперь ISMCTS всегда maximise для viewpoint = Me.
-        Player vp = Player::Me;
+        // FIX #4 (viewpoint bug): viewpoint должен быть currentPlayer(),
+        // чтобы ISMCTS максимизировал для стороны, которая реально ходит.
+        // Раньше стоял vp = Player::Me всегда — это означало, что когда ход
+        // соперника, ISMCTS максимизировал для Me, а не для Opp. Бот отдавал
+        // Opp'у ходы, лучшие для Me (т.е. худшие для Opp), и в self-play
+        // генерились противоречивые policy-метки: encode_state() кодировал
+        // состояние с перспективы currentPlayer, а ISMCTS искал лучший ход
+        // для Me даже в позициях, где ходит Opp.
+        Player vp = currentPlayer();
         IsmctsLimits lim;
         lim.timeBudgetSec = time_budget;
         lim.numThreads = std::max(1, num_threads);
@@ -281,6 +284,7 @@ public:
     // ---- Возвращает root value из сети (для мониторинга) ----
     float get_root_value() {
         if (!has_model()) return 0.5f;
+        // FIX #4: тот же фикс viewpoint, что и в run_ismcts.
         Player vp = currentPlayer();
         IsmctsLimits lim;
         lim.timeBudgetSec = 0.01;

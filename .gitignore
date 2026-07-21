@@ -13,6 +13,12 @@ build/
 *.pdb
 *.ilk
 
+# Бинарники (FIX: собранные .pyd/.so/.dll не должны лежать в репе)
+*.pyd
+*.so
+*.dll
+!engine/third_party/**/*.dll
+
 # Логи и локальные файлы
 *.log
 .env

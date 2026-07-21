@@ -31,6 +31,7 @@ ValidationResult validateTransfer(const GameState& s, const Move& m);
 ValidationResult validateToss(const GameState& s, const Move& m);
 ValidationResult validateTake(const GameState& s, const Move& m);
 ValidationResult validateDone(const GameState& s, const Move& m);
+ValidationResult validatePass(const GameState& s, const Move& m);
 
 // Единая точка валидации: разбирает Move по action и вызывает нужную проверку.
 ValidationResult validateMove(const GameState& s, const Move& m);

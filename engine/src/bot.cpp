@@ -5,6 +5,7 @@
 #include "rules_fast.h"
 #include "rules.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <random>
 
@@ -71,7 +72,12 @@ MatchState toMatchState(const GameState& s, const Knowledge& k) {
     m.firstTrick = s.firstTrick;
     m.transferEnabled = s.transferEnabled;
     m.flashEnabled = s.flashEnabled;
-    m.pairsLimit = 6;
+    // FIX #18: пробрасываем пользовательскую настройку лимита первого кона.
+    // Раньше хардкодилось pairsLimit = 6, а firstTrick ? 5 тоже хардкодилось
+    // в pairsHeadroom() — это расходилось с rules.cpp::maxPairsThisTrick,
+    // который использовал firstTrickLimit из GameState.
+    m.pairsLimit = s.firstTrick ? std::min(s.firstTrickLimit, 5)
+                                : 6;
     m.attacker = (s.attacker == Side::Me) ? Player::Me : Player::Opp;
     m.turn = (s.turn == Side::Me) ? Player::Me : Player::Opp;
     m.phase = (s.phase == Phase::Attack) ? MatchPhase::Attack : MatchPhase::Defense;
