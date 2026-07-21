@@ -46,38 +46,20 @@ inline std::mt19937_64& rng() {
     return r;
 }
 
-CardMask sampleSubset(CardMask pool, int k) {
-    int idx[36];
-    int n = 0;
-    CardMask p = pool;
-    while (p) {
-        CardMask bit = p & (~p + 1);
-        p ^= bit;
-        int i;
-#if defined(_MSC_VER)
-        unsigned long ul; _BitScanForward64(&ul, bit); i = (int)ul;
-#else
-        i = __builtin_ctzll(bit);
-#endif
-        idx[n++] = i;
-    }
-    if (k > n) k = n;
-    if (k <= 0) return 0;
-    auto& r = rng();
-    for (int i = 0; i < k; ++i) {
-        int j = i + (int)(r() % (unsigned)(n - i));
-        std::swap(idx[i], idx[j]);
-    }
-    CardMask out = 0;
-    for (int i = 0; i < k; ++i) out |= (uint64_t(1) << idx[i]);
-    return out;
-}
+// Task 2: uniform sampleSubset удалён — заменён на Knowledge::sampleOppHandWeighted.
+// Байесовская матрица вероятностей в Knowledge даёт более качественную выборку
+// руки оппонента, чем uniform сэмплинг.
 
 MatchState determine(const MatchState& root, const Knowledge& k, Player viewpoint) {
     MatchState s = root;
     CardMask pool = k.unknownPool();
     int oppNeed = std::min<int>(k.oppHandCount, popCount(pool));
-    CardMask oppHand = sampleSubset(pool, oppNeed);
+
+    // Task 2: weighted sampling из байесовской матрицы вероятностей.
+    // Если все oppProbs однородны (нет информации) — это эквивалентно uniform sampleSubset.
+    // Если есть отказы (refusal) — карты с prob=0 не сэмплируются, остальные повышают долю.
+    uint64_t seed = rng()();
+    CardMask oppHand = k.sampleOppHandWeighted(pool, oppNeed, seed);
     pool &= ~oppHand;
 
     s.hands[toIdx(viewpoint)] = k.myHand;
