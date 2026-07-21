@@ -165,6 +165,44 @@ Move Bot::decide(const GameState& s, const Knowledge& k,
         return m;
     }
 
+    // ---------- Task 5: Early Endgame Trigger ----------
+    // Когда в колоде осталось мало карт (≤ EARLY_ENDGAME_THRESHOLD), но не 0,
+    // ISMCTS тратит бюджет на ветки с высокой вариативностью из-за случайного
+    // добора. Sampled minimax даёт более надёжное решение: сэмплируем N
+    // детерминизаций руки оппонента (по байесовской матрице oppProbs),
+    // для каждой запускаем точный α-β, усредняем winrate.
+    constexpr int EARLY_ENDGAME_THRESHOLD = 6;
+    if (s.deck.remaining > 0 && s.deck.remaining <= EARLY_ENDGAME_THRESHOLD) {
+        EndgameLimits elim;
+        elim.timeBudgetSec = timeoutFor(settings.strength);
+        // Адаптивное число сэмплов: при budget=2s и ~50ms на сэмпл = ~40 сэмплов.
+        // При budget=0.5s = ~10 сэмплов.
+        int nSamples = std::max(8, std::min(50,
+            (int)(elim.timeBudgetSec * 1000.0 / 50.0)));
+        EndgameResult er = bestSampledEndgameMove(root, k, Player::Me,
+                                                   elim, nSamples, nullptr);
+
+        if (er.move.action != Action::Pass) {
+            stats.mode = "EarlyEndgame";
+            stats.depthReached = er.depthReached;
+            stats.solved = er.solved;
+            stats.timeMs = er.timeMs;
+            stats.playouts = er.nodes;
+            if (statsOut) *statsOut = stats;
+
+            Move m = er.move;
+            if (m.reason.empty()) {
+                char buf[200];
+                std::snprintf(buf, sizeof(buf),
+                    "Early endgame (deck=%d): %d sampled minimax, score=%d, %.0fms",
+                    s.deck.remaining, nSamples, er.score, er.timeMs);
+                m.reason = buf;
+            }
+            return m;
+        }
+        // Если sampled endgame не дал результат — fallback на ISMCTS ниже.
+    }
+
     // ---------- Фаза с колодой → ISMCTS ----------
     // FIX (этап 0.1): передаём сеть ТОЛЬКО если она реально загружена.
     // При отсутствии сети (по умолчанию для математического бота) — nullptr,

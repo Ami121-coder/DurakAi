@@ -2,10 +2,14 @@
 #include "rules_fast.h"
 #include "bitboard.h"
 #include "card.h"
+#include "knowledge.h"
 #include "move_ordering.h"  // Task 1: move ordering в α-β
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <random>
+#include <unordered_map>
 
 namespace durakk {
 
@@ -203,6 +207,108 @@ EndgameResult bestEndgameMove(MatchState s, Player viewpoint, const EndgameLimit
     res.move = bestSoFar;
     res.nodes = ctx.nodes;
     res.timeMs = std::chrono::duration<double, std::milli>(Clock::now() - ctx.start).count();
+    return res;
+}
+
+// ============================================================================
+// Task 5: Sampled Endgame — для случая когда в колоде осталось ≤ EARLY_ENDGAME_THRESHOLD карт.
+// ============================================================================
+
+EndgameResult bestSampledEndgameMove(const MatchState& s, const Knowledge& k,
+                                     Player viewpoint,
+                                     const EndgameLimits& lim,
+                                     int nSamples,
+                                     std::atomic<bool>* stopFlag) {
+    EndgameResult res;
+    res.move = Move{ Action::Pass, Card{}, Card{}, false, {} };
+    auto start = Clock::now();
+    auto deadline = start + std::chrono::milliseconds(static_cast<long long>(lim.timeBudgetSec * 1000));
+    if (stopFlag && stopFlag->load()) return res;
+
+    // Корневые ходы (для всех сэмплов они одинаковые — меняется только рука оппонента).
+    MoveBuffer rootBuf;
+    int rootN = genLegalMoves(s, rootBuf);
+    if (rootN == 0) return res;
+
+    // Для каждого хода — сумма оценок по всем сэмплам.
+    // Положительная оценка = хорошо для viewpoint.
+    std::vector<double> moveScores(rootN, 0.0);
+    std::vector<int> moveCounts(rootN, 0);
+
+    // Считаем максимум сэмплов = min(nSamples, доступное время).
+    int actualSamples = std::max(1, nSamples);
+
+    // Генератор случайных чисел для сэмплов.
+    static thread_local std::mt19937_64 rng{ std::random_device{}() };
+
+    for (int sampleIdx = 0; sampleIdx < actualSamples; ++sampleIdx) {
+        if (Clock::now() >= deadline) break;
+        if (stopFlag && stopFlag->load()) break;
+
+        // Сэмплируем руку оппонента по байесовской матрице oppProbs.
+        CardMask pool = k.unknownPool();
+        int oppNeed = std::min<int>(k.oppHandCount, popCount(pool));
+        uint64_t seed = rng();
+        CardMask oppHand = k.sampleOppHandWeighted(pool, oppNeed, seed);
+        CardMask deck = pool & ~oppHand;
+
+        // Строим детерминированное состояние.
+        MatchState det = s;
+        det.hands[toIdx(viewpoint)] = k.myHand;
+        det.hands[toIdx(other(viewpoint))] = oppHand;
+        det.deck = deck;
+        det.deckRemaining = k.deckRemaining;
+        det.trump = k.trump;
+
+        // Запускаем точный endgame α-β для каждого хода.
+        // ВАЖНО: используем ОДНУ TTable для всех ходов одного сэмпла
+        // (но разные для разных сэмплов — иначе загрязнение).
+        SearchCtx ctx;
+        ctx.viewpoint = viewpoint;
+        ctx.start = Clock::now();
+        // На каждый сэмпл — не более 1/actualSamples от общего бюджета.
+        double sampleBudget = (double)std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - Clock::now()).count() / std::max(1, actualSamples - sampleIdx);
+        ctx.deadline = Clock::now() + std::chrono::milliseconds(
+            static_cast<long long>(sampleBudget));
+        ctx.tt.newGeneration();
+
+        for (int i = 0; i < rootN; ++i) {
+            if (ctx.timeUp()) break;
+            MatchState child = det;
+            if (!applyMove(child, rootBuf[i])) {
+                // Нелегальный в этой детерминизации (оппонент не может ответить
+                // как ожидается). Пропускаем — не учитываем в оценке.
+                continue;
+            }
+            int val = -negamax(child, lim.maxDepth, -20000, 20000, ctx);
+            // val — оценка с точки зрения соперника (negamax). Переворачиваем.
+            moveScores[i] += val;
+            moveCounts[i] += 1;
+        }
+
+        res.nodes += ctx.nodes;
+    }
+
+    // Выбираем ход с максимальным средним score.
+    int bestIdx = -1;
+    double bestAvg = -1e18;
+    for (int i = 0; i < rootN; ++i) {
+        if (moveCounts[i] == 0) continue;
+        double avg = moveScores[i] / moveCounts[i];
+        if (avg > bestAvg) {
+            bestAvg = avg;
+            bestIdx = i;
+        }
+    }
+
+    // Fallback: если ни один ход не был оценён (маловероятно) — первый.
+    if (bestIdx < 0) bestIdx = 0;
+
+    res.move = rootBuf[bestIdx];
+    res.score = (bestAvg > 5000) ? 1 : (bestAvg < -5000 ? -1 : 0);
+    res.solved = (bestAvg > 5000 || bestAvg < -5000);
+    res.timeMs = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     return res;
 }
 
