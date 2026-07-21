@@ -134,6 +134,11 @@ class GameStateSnapshot:
     flash_used_this_trick: bool = False
     # История текущего кона (для отслеживания переводов/проездного)
     transfers_this_trick: int = 0
+    # FIX strict_arena: флаг прямого завершения игры (из env, если snap
+    # построен через _snapshot_from_env). Если True — арена должна завершить
+    # цикл ходов без проверки условий.
+    is_game_over: bool = False
+    winner: int = -1            # -1 = не закончена, 0 = Me, 1 = Opp
 
 
 # ===========================================================================

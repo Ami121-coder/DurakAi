@@ -261,10 +261,34 @@ class WorkerProcess:
                 return None, resp["error"]
             return resp.get("move"), None
 
-    def apply_action(self, action_idx: int):
+    def apply_action(self, action_idx: int) -> Optional[dict]:
+        """
+        FIX strict_arena: apply теперь возвращает НОВЫЙ снапшот из env.
+        Арена использует это для синхронизации своего канонического снимка
+        с реальным состоянием движка в воркере. Возвращает snapshot dict
+        или None при ошибке.
+        """
         with self._lock:
             self._send({"cmd": "apply", "action": action_idx})
-            self._recv()
+            try:
+                resp = self._recv()
+            except RuntimeError:
+                return None
+            if not resp.get("ok", False):
+                return None
+            return resp.get("snapshot")
+
+    def get_state(self) -> Optional[dict]:
+        """Запрос полного состояния env. Возвращает snapshot dict или None."""
+        with self._lock:
+            self._send({"cmd": "get_state"})
+            try:
+                resp = self._recv()
+            except RuntimeError:
+                return None
+            if not resp.get("ok", False):
+                return None
+            return resp.get("snapshot")
 
     def close(self):
         try:
@@ -373,14 +397,96 @@ def _worker_main(spec: BotSpec):
                 print(json.dumps({"error": str(e)}), flush=True)
 
         elif cmd == "apply":
+            # Применяем ход в env воркера. Возвращаем ok + новый снапшот,
+            # чтобы арена могла перепроверить состояние (FIX синхронизации).
             try:
                 ok = env.step(int(msg["action"]))
-                print(json.dumps({"ok": ok}), flush=True)
+                # Получаем свежий снапшот после применения хода.
+                snap = env.get_state_snapshot()
+                print(json.dumps({"ok": ok, "snapshot": _snapshot_to_jsonable(snap)}),
+                      flush=True)
+            except Exception as e:
+                print(json.dumps({"ok": False, "error": str(e)}), flush=True)
+
+        elif cmd == "get_state":
+            # FIX strict_arena: возвращаем полное состояние env в формате,
+            # понятном арене. Это источник правды — арена строит свой
+            # канонический снимок из этих данных, а не из своего ГПСЧ.
+            try:
+                snap = env.get_state_snapshot()
+                print(json.dumps({"ok": True, "snapshot": _snapshot_to_jsonable(snap)}),
+                      flush=True)
             except Exception as e:
                 print(json.dumps({"ok": False, "error": str(e)}), flush=True)
 
         else:
             print(json.dumps({"error": f"unknown cmd: {cmd}"}), flush=True)
+
+
+def _snapshot_to_jsonable(snap: dict) -> dict:
+    """Конвертирует py::dict-снапшот из durakk_env в JSON-сериализуемый формат.
+
+    durakk_env.get_state_snapshot() возвращает масть как int (0..3) и ранг
+    как строку ("6".."A"). Приводим к каноническому строковому виду арены:
+      suit_int → "clubs"/"diamonds"/"hearts"/"spades"
+      rank_str остаётся как есть
+      phase_int → "attack"/"defense"/"pursue"/"done"/"gameover"
+      attacker_int / turn_int → "me"/"opp" (учитывая viewpoint)
+    """
+    SUITS = ["clubs", "diamonds", "hearts", "spades"]
+    PHASES = ["attack", "defense", "pursue", "done", "gameover"]
+
+    def conv_card(c):
+        if c is None:
+            return None
+        # c может быть dict с int suit или dict со строкой suit.
+        if isinstance(c.get("s"), int):
+            s = SUITS[c["s"]] if 0 <= c["s"] < 4 else "?"
+        else:
+            s = c.get("s", "?")
+        return {"r": c.get("r", "?"), "s": s}
+
+    viewpoint = snap.get("viewpoint", 0)
+    attacker_int = snap.get("attacker", 0)
+    turn_int = snap.get("turn", 0)
+    phase_int = snap.get("phase", 0)
+
+    # int → "me"/"opp" с учётом viewpoint.
+    # В C++ Player::Me=0, Player::Opp=1.
+    # viewpoint=0 → "me" = Me. viewpoint=1 → "me" = Opp (перспектива перевёрнута).
+    # Но в strict_arena мы всегда держим perspective = Me (viewpoint=0),
+    # потому что init_game всегда инициализирует env с viewpoint=Me.
+    def side_of(player_int):
+        # В наших запусках viewpoint=Me всегда, поэтому Player::Me → "me".
+        return "me" if player_int == 0 else "opp"
+
+    table_list = []
+    for p in snap.get("table", []):
+        pair = {
+            "attack": conv_card(p.get("attack")),
+            "defense": conv_card(p.get("defense")) if p.get("defended") else None,
+            "defended": bool(p.get("defended", False)),
+        }
+        table_list.append(pair)
+
+    return {
+        "trump": SUITS[snap.get("trump", 0)] if isinstance(snap.get("trump"), int) else snap.get("trump", "spades"),
+        "transferEnabled": bool(snap.get("transferEnabled", True)),
+        "flashEnabled": bool(snap.get("flashEnabled", False)),
+        "firstTrick": bool(snap.get("firstTrick", True)),
+        "pairsLimit": int(snap.get("pairsLimit", 6)),
+        "deckRemaining": int(snap.get("deckRemaining", 0)),
+        "attacker": side_of(attacker_int),
+        "turn": side_of(turn_int),
+        "phase": PHASES[phase_int] if 0 <= phase_int < len(PHASES) else "attack",
+        "viewpoint": "me" if viewpoint == 0 else "opp",
+        "myHand": [conv_card(c) for c in snap.get("myHand", [])],
+        "oppHandCount": int(snap.get("oppHandCount", 0)),
+        "table": table_list,
+        "discard": [conv_card(c) for c in snap.get("discard", [])],
+        "isGameOver": bool(snap.get("isGameOver", False)),
+        "winner": int(snap.get("winner", -1)),
+    }
 
 
 def _action_idx_to_move(env, action_idx: int) -> dict:
@@ -520,8 +626,19 @@ class StrictArena:
         self._worker_a.init_game(seed, "me" if bot_a_is_me else "opp")
         self._worker_b.init_game(seed, "me" if not bot_a_is_me else "opp")
 
-        # Каноническое состояние арены. Это — ИСТИНА, воркеры только предлагают.
-        snap = self._fresh_snapshot(seed)
+        # FIX strict_arena: канонический снимок строим из РЕАЛЬНОГО состояния
+        # движка в воркере A (или B — без разницы, раздача одинаковая, т.к.
+        # reset_with_seed детерминирован). Раньше арена генерировала свою
+        # раздачу через Python random.Random, что не совпадало с C++ mt19937_64
+        # в durakk_env — это вызывало ложные штрафы "карты нет в руке".
+        raw_snap = self._worker_a.get_state()
+        if raw_snap is None:
+            record.end_reason = self.PENALTY_WORKER_DEAD
+            record.end_rule = ""
+            record.winner = "draw"
+            record.duration_sec = 0.0
+            return record
+        snap = self._snapshot_from_env(raw_snap, bot_a_is_me)
 
         t_start = time.time()
         ply = 0
@@ -601,14 +718,33 @@ class StrictArena:
                     print(f"  [ШТРАФ] {bot_name}: {result.reason} ({result.rule})")
                     break
 
-                # Применить ход к снапшоту.
-                apply_move_to_snapshot(snap, norm_move)
-                # Синхронизировать воркер (чтобы его внутренний env был в той же позиции).
+                # Применить ход в env воркера, который ходил.
+                # FIX strict_arena: используем НОВЫЙ снапшот из env как источник
+                # правды. Это гарантирует, что арена и воркер видят одно и то же
+                # состояние — без рассинхронизации.
+                if move.get("action_idx") is not None:
+                    new_raw = bot.apply_action(move["action_idx"])
+                    if new_raw is not None:
+                        # Заменяем наш snap на реальный из env.
+                        snap = self._snapshot_from_env(new_raw, bot_a_is_me)
+                    else:
+                        # Воркер не смог применить — но арена валидировала ход
+                        # как легальный, значит apply_move_to_snapshot корректен.
+                        apply_move_to_snapshot(snap, norm_move)
+                else:
+                    # Пасс/Take/Done — action_idx мог быть None для не-карточных
+                    # действий. Применяем локально.
+                    apply_move_to_snapshot(snap, norm_move)
+
+                # Второй воркер (противник) должен применить тот же ход, чтобы
+                # его env был в той же позиции для следующего ask_action.
+                other_bot = self._worker_b if (current_player == "me") == bot_a_is_me else self._worker_a
                 if move.get("action_idx") is not None:
                     try:
-                        bot.apply_action(move["action_idx"])
+                        other_bot.apply_action(move["action_idx"])
                     except Exception:
                         pass  # не критично — арена всё равно источник правды
+
                 ply += 1
         except Exception as e:
             record.end_reason = self.PENALTY_WORKER_DEAD
@@ -622,8 +758,15 @@ class StrictArena:
                 # Игра дошла до конца нормально.
                 record.end_ply = ply
                 record.end_reason = "normal"
-                # Определим победителя.
-                if len(snap.my_hand) == 0 and snap.opp_hand_count > 0:
+                # Определим победителя. Приоритет — данные из env (winner),
+                # затем по размеру рук.
+                env_winner = getattr(snap, "winner", -1)
+                # env_winner: 0 = Me, 1 = Opp, -1 = ничья/не закончена.
+                if env_winner == 0:
+                    record.winner = "A" if bot_a_is_me else "B"
+                elif env_winner == 1:
+                    record.winner = "B" if bot_a_is_me else "A"
+                elif len(snap.my_hand) == 0 and snap.opp_hand_count > 0:
                     record.winner = "A" if bot_a_is_me else "B"
                 elif snap.opp_hand_count == 0 and len(snap.my_hand) > 0:
                     record.winner = "B" if bot_a_is_me else "A"
@@ -633,18 +776,21 @@ class StrictArena:
         return record
 
     def _fresh_snapshot(self, seed: int) -> GameStateSnapshot:
-        """Создаёт стартовый снимок: 6+6 карт, колода 24 (36−12), первый ход Me."""
+        """
+        DEPRECATED: оставлен только для совместимости со старыми тестами.
+        В реальной арене больше НЕ используется — вместо него вызывается
+        _snapshot_from_env(), который строит снимок из РЕАЛЬНОГО состояния
+        движка (через get_state воркера).
+        """
         rng = random.Random(seed)
-        # Сгенерируем колоду, раздадим по 6.
         suits = ["clubs", "diamonds", "hearts", "spades"]
         ranks = ["6", "7", "8", "9", "10", "J", "Q", "K", "A"]
         deck = [{"r": r, "s": s} for s in suits for r in ranks]
         rng.shuffle(deck)
         trump = deck[0]["s"]
-        # Первая карта — козырь-индикатор. После раздачи 12 карт, в колоде 23.
         my_hand = deck[1:7]
         opp_hand = deck[7:13]
-        deck_remaining = 36 - 12  # 24
+        deck_remaining = 36 - 12
         return GameStateSnapshot(
             deck_size=36, trump=trump, transfer_enabled=True, flash_enabled=False,
             first_trick_limit=5,
@@ -654,7 +800,73 @@ class StrictArena:
             flash_used_this_trick=False, transfers_this_trick=0,
         )
 
+    def _snapshot_from_env(self, raw: dict, bot_a_is_me: bool) -> GameStateSnapshot:
+        """
+        Строит канонический GameStateSnapshot из РЕАЛЬНОГО состояния движка.
+
+        raw — это JSON-словарь, который вернул воркер через get_state/apply.
+        В нём viewpoint="me" (мы всегда инициализируем env с viewpoint=Me),
+        а myHand — это рука того игрока, который играет за "me" в env.
+
+        ВАЖНО: оба воркера (A и B) инициализируются с viewpoint=Me через
+        init_game(as_player="me"). Поэтому в обоих воркерах "myHand" = рука
+        игрока Me (сторона 0). Арена работает в той же перспективе —
+        snap.my_hand = рука Me.
+
+        bot_a_is_me=True → воркер A играет за Me. Это значит, что когда ход
+        Me, мы спрашиваем action у A; когда ход Opp — у B.
+        """
+        # Канонический снимок всегда в перспективе Me (как и в env).
+        trump = raw.get("trump", "spades")
+        my_hand = list(raw.get("myHand", []))
+        opp_hand_count = int(raw.get("oppHandCount", 0))
+        deck_remaining = int(raw.get("deckRemaining", 0))
+        first_trick = bool(raw.get("firstTrick", True))
+        pairs_limit = int(raw.get("pairsLimit", 6))
+
+        # Стол уже приходит в правильном формате {attack, defense|None, defended}.
+        table = []
+        for p in raw.get("table", []):
+            table.append({
+                "attack": p.get("attack"),
+                "defense": p.get("defense"),
+                "defended": bool(p.get("defended", False)),
+            })
+
+        # discard — список карт.
+        discard = list(raw.get("discard", []))
+
+        # Стороны и фаза.
+        attacker = raw.get("attacker", "me")
+        turn = raw.get("turn", "me")
+        phase = raw.get("phase", "attack")
+
+        return GameStateSnapshot(
+            deck_size=36,
+            trump=trump,
+            transfer_enabled=bool(raw.get("transferEnabled", True)),
+            flash_enabled=bool(raw.get("flashEnabled", False)),
+            first_trick_limit=5 if first_trick else pairs_limit,
+            my_hand=my_hand,
+            opp_hand_count=opp_hand_count,
+            table=table,
+            deck_remaining=deck_remaining,
+            discard=discard,
+            attacker=attacker,
+            turn=turn,
+            phase=phase,
+            first_trick=first_trick,
+            flash_used_this_trick=False,  # не трекается в env (TODO)
+            transfers_this_trick=0,        # не трекается в env (TODO)
+            is_game_over=bool(raw.get("isGameOver", False)),
+            winner=int(raw.get("winner", -1)),
+        )
+
     def _is_game_over(self, snap: GameStateSnapshot) -> bool:
+        # FIX strict_arena: snap теперь приходит напрямую из env, поэтому
+        # проверяем также флаг isGameOver (если он есть в атрибутах).
+        if getattr(snap, "is_game_over", False):
+            return True
         if snap.deck_remaining > 0:
             return False
         if len(snap.my_hand) == 0 or snap.opp_hand_count == 0:

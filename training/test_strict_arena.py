@@ -241,6 +241,90 @@ def test_higher_trump_beats_lower_trump():
     print("✓ test_higher_trump_beats_lower_trump: 7♥/K♥ бьют 6♥")
 
 
+def test_snapshot_from_env():
+    """_snapshot_from_env корректно преобразует raw dict из env в GameStateSnapshot."""
+    from strict_arena import StrictArena, BotSpec
+    # Создадим минимальный StrictArena (без запуска воркеров).
+    bot_a = BotSpec(name="A", kind="random")
+    bot_b = BotSpec(name="B", kind="random")
+    arena = StrictArena(bot_a, bot_b)
+
+    # Raw dict, как его возвращает durakk_env.get_state_snapshot()
+    # (после конвертации в _snapshot_to_jsonable).
+    raw = {
+        "trump": "hearts",
+        "transferEnabled": True,
+        "flashEnabled": False,
+        "firstTrick": True,
+        "pairsLimit": 6,
+        "deckRemaining": 23,
+        "attacker": "me",
+        "turn": "opp",
+        "phase": "defense",
+        "viewpoint": "me",
+        "myHand": [
+            {"r": "7", "s": "clubs"},
+            {"r": "K", "s": "diamonds"},
+            {"r": "6", "s": "hearts"},
+        ],
+        "oppHandCount": 5,
+        "table": [
+            {"attack": {"r": "7", "s": "spades"}, "defense": None, "defended": False},
+        ],
+        "discard": [],
+        "isGameOver": False,
+        "winner": -1,
+    }
+    snap = arena._snapshot_from_env(raw, bot_a_is_me=True)
+    assert snap.trump == "hearts"
+    assert snap.attacker == "me"
+    assert snap.turn == "opp"
+    assert snap.phase == "defense"
+    assert len(snap.my_hand) == 3
+    assert snap.my_hand[0] == {"r": "7", "s": "clubs"}
+    assert snap.opp_hand_count == 5
+    assert len(snap.table) == 1
+    assert snap.deck_remaining == 23
+    assert snap.is_game_over is False
+    assert snap.winner == -1
+
+    # Теперь валидный ход: K♦ не бьёт 7♠ (разные масти), 6♥ бьёт козырем.
+    r = validate_move(snap, {"action": "defend", "card": {"r": "6", "s": "hearts"}})
+    assert r.ok, r.reason
+    print(f"✓ test_snapshot_from_env: trump={snap.trump}, hand_size={len(snap.my_hand)}")
+
+
+def test_snapshot_from_env_gameover():
+    """Если env говорит isGameOver=True, snap.is_game_over=True."""
+    from strict_arena import StrictArena, BotSpec
+    bot_a = BotSpec(name="A", kind="random")
+    bot_b = BotSpec(name="B", kind="random")
+    arena = StrictArena(bot_a, bot_b)
+    raw = {
+        "trump": "spades",
+        "transferEnabled": True,
+        "flashEnabled": False,
+        "firstTrick": False,
+        "pairsLimit": 6,
+        "deckRemaining": 0,
+        "attacker": "me",
+        "turn": "me",
+        "phase": "attack",
+        "viewpoint": "me",
+        "myHand": [],   # я без карт — победил
+        "oppHandCount": 3,
+        "table": [],
+        "discard": [],
+        "isGameOver": True,
+        "winner": 0,   # Me победил
+    }
+    snap = arena._snapshot_from_env(raw, bot_a_is_me=True)
+    assert snap.is_game_over is True
+    assert snap.winner == 0
+    assert arena._is_game_over(snap) is True
+    print("✓ test_snapshot_from_env_gameover: корректно распознаёт конец игры")
+
+
 def main():
     print("=== Тесты strict_arena ===\n")
     tests = [
@@ -254,6 +338,8 @@ def main():
         test_first_trick_limit,
         test_trump_beats_non_trump,
         test_higher_trump_beats_lower_trump,
+        test_snapshot_from_env,
+        test_snapshot_from_env_gameover,
     ]
     n_ok = 0
     n_fail = 0

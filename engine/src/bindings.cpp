@@ -41,6 +41,25 @@ constexpr int kActionTake = 36;
 constexpr int kActionDone = 37;
 constexpr int kStateSize  = 220;
 
+// ---- Хелпер для экспорта ранга в JSON-совместимый символ ----
+// Возвращаем строковый код: "6".."10","J","Q","K","A".
+// FIX strict_arena: раньше использовался статический char, но для ранга "10"
+// нужно два символа. Поэтому std::string.
+inline std::string rankToChar(Rank r) {
+    switch (r) {
+        case Rank::Six:   return "6";
+        case Rank::Seven: return "7";
+        case Rank::Eight: return "8";
+        case Rank::Nine:  return "9";
+        case Rank::Ten:   return "10";
+        case Rank::Jack:  return "J";
+        case Rank::Queen: return "Q";
+        case Rank::King:  return "K";
+        case Rank::Ace:   return "A";
+    }
+    return "?";
+}
+
 // ---- Раздача 36-карточной колоды (без изменений) ----
 struct DealResult {
     CardMask hands[2];
@@ -308,6 +327,106 @@ public:
         return d;
     }
 
+    // ---- FIX strict_arena: экспорт полного состояния для синхронизации ----
+    // Раньше арена генерировала свою раздачу (через Python random.Random),
+    // что не совпадало с раздачей durakk_env (через std::mt19937_64 в C++).
+    // Это приводило к ложным штрафам: бот выбирал карту из своей РЕАЛЬНОЙ
+    // руки, а арена валидировала против своей ВЫДУМАННОЙ — карта "не в руке".
+    //
+    // Теперь арена запрашивает getStateSnapshot() у воркера и строит
+    // канонический снимок из РЕАЛЬНОГО состояния движка.
+    py::dict getStateSnapshot() const {
+        py::dict d;
+
+        // Настройки стола.
+        d["trump"] = static_cast<int>(state.trump);
+        d["transferEnabled"] = state.transferEnabled;
+        d["flashEnabled"] = state.flashEnabled;
+        d["firstTrick"] = state.firstTrick;
+        d["pairsLimit"] = state.pairsLimit;
+        d["deckRemaining"] = state.deckRemaining;
+
+        // Чей ход / роли / фаза.
+        d["attacker"] = static_cast<int>(state.attacker);  // 0=Me, 1=Opp
+        d["turn"] = static_cast<int>(state.turn);
+        // MatchPhase: Attack=0, Defense=1, Pursue=2, Done=3, GameOver=4
+        d["phase"] = static_cast<int>(state.phase);
+
+        // viewpoint: с чьей перспективы видим руку. В arena ussually = 0 (Me).
+        d["viewpoint"] = static_cast<int>(viewpoint);
+
+        // Моя рука (полная видимость).
+        py::list my_hand;
+        CardMask myMask = state.hands[toIdx(viewpoint)];
+        CardMask m = myMask;
+        while (m) {
+            CardMask bit = m & (~m + 1);
+            m ^= bit;
+            int idx;
+#if defined(_MSC_VER)
+            unsigned long ul; _BitScanForward64(&ul, bit); idx = (int)ul;
+#else
+            idx = __builtin_ctzll(bit);
+#endif
+            Card c = indexToCard(idx);
+            py::dict card_obj;
+            card_obj["r"] = rankToChar(c.rank);
+            card_obj["s"] = static_cast<int>(c.suit);
+            my_hand.append(card_obj);
+        }
+        d["myHand"] = my_hand;
+
+        // Сколько карт у соперника (точное содержимое не раскрываем —
+        // арена использует только количество, как и должно быть в реальной игре).
+        d["oppHandCount"] = popCount(state.hands[toIdx(other(viewpoint))]);
+
+        // Стол.
+        py::list table_list;
+        for (int i = 0; i < state.tableLen; ++i) {
+            py::dict pair;
+            py::dict atk;
+            atk["r"] = rankToChar(state.table[i].attack.rank);
+            atk["s"] = static_cast<int>(state.table[i].attack.suit);
+            pair["attack"] = atk;
+            if (state.table[i].defended) {
+                py::dict def;
+                def["r"] = rankToChar(state.table[i].defense.rank);
+                def["s"] = static_cast<int>(state.table[i].defense.suit);
+                pair["defense"] = def;
+                pair["defended"] = true;
+            } else {
+                pair["defense"] = py::none();
+                pair["defended"] = false;
+            }
+            table_list.append(pair);
+        }
+        d["table"] = table_list;
+
+        // Бито (discard).
+        py::list discard_list;
+        CardMask disc = state.discard;
+        while (disc) {
+            CardMask bit = disc & (~disc + 1);
+            disc ^= bit;
+            int idx;
+#if defined(_MSC_VER)
+            unsigned long ul; _BitScanForward64(&ul, bit); idx = (int)ul;
+#else
+            idx = __builtin_ctzll(bit);
+#endif
+            Card c = indexToCard(idx);
+            py::dict card_obj;
+            card_obj["r"] = rankToChar(c.rank);
+            card_obj["s"] = static_cast<int>(c.suit);
+            discard_list.append(card_obj);
+        }
+        d["discard"] = discard_list;
+
+        d["isGameOver"] = state.isGameOver();
+        d["winner"] = state.winner();
+        return d;
+    }
+
     bool isGameOver() const { return state.isGameOver(); }
     int winner() const { return state.winner(); }
     int currentPlayerIdx() const { return static_cast<int>(currentPlayer()); }
@@ -410,7 +529,9 @@ PYBIND11_MODULE(durakk_env, m) {
         .def("is_game_over", &DurakEnv::isGameOver)
         .def("winner", &DurakEnv::winner)
         .def("current_player", &DurakEnv::currentPlayerIdx)
-        .def("get_stats", &DurakEnv::getStats);
+        .def("get_stats", &DurakEnv::getStats)
+        // FIX strict_arena: экспорт полного состояния для синхронизации арены.
+        .def("get_state_snapshot", &DurakEnv::getStateSnapshot);
     m.attr("ACTION_SIZE") = kActionSize;
     m.attr("ACTION_TAKE") = kActionTake;
     m.attr("ACTION_DONE") = kActionDone;
