@@ -3,7 +3,7 @@
 
 namespace durakk {
 
-PVResult RandomNet::evaluate(const MatchState& s, Player /*viewpoint*/) {
+PVResult RandomNet::evaluate(const MatchState& s, const Knowledge& /*k*/, Player /*viewpoint*/) {
     // Заглушка: равномерное распределение по всем легальным ходам.
     MoveBuffer buf;
     int n = genLegalMoves(s, buf);

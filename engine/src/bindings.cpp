@@ -39,7 +39,14 @@ namespace durakk {
 constexpr int kActionSize = 38;
 constexpr int kActionTake = 36;
 constexpr int kActionDone = 37;
-constexpr int kStateSize  = 220;
+// Task 3: Neural-Bayesian Fusion.
+// Было: 220 = 5 масок × 36 + 40 скаляров.
+// Стало: 256 = 6 масок × 36 + 40 скаляров.
+// Добавлен 6-й канал oppProbs[36] — байесовские вероятности каждой карты
+// быть у оппонента. Значения: 0..255 (float в [0,1] после нормализации).
+// Сеть учится оценивать позицию с учётом неопределённости — это критично
+// для силы в midgame, когда у оппонента много неизвестных карт.
+constexpr int kStateSize  = 256;
 
 // ---- Хелпер для экспорта ранга в JSON-совместимый символ ----
 // Возвращаем строковый код: "6".."10","J","Q","K","A".
@@ -197,29 +204,41 @@ public:
         writeMask(defMask);                     // [108..143] защиты
         writeMask(state.discard);               // [144..179] бито
 
-        // Скаляры [180..219] — 40 байт
+        // Task 3: 6-й канал — байесовские вероятности карт у оппонента.
+        // [180..215] = 36 байт. Каждая ячейка = uint8(oppProbs[i] * 255).
+        // Сеть делит uint8 на 255 (model_resnet.py forward), получая float в [0,1].
+        // Этот канал даёт сети ПРЯМОЙ доступ к неопределённости — она учится
+        // оценивать риск (например, «у оппонента 80% есть козырный Туз → плохая позиция»).
+        for (int i = 0; i < 36; ++i) {
+            float prob = k.oppProbs[i];
+            if (prob < 0.0f) prob = 0.0f;
+            if (prob > 1.0f) prob = 1.0f;
+            *p++ = (uint8_t)(prob * 255.0f + 0.5f);
+        }
+
+        // Скаляры [216..255] — 40 байт
         // Козырь one-hot (4 байта) + скалярные фичи
         for (int s = 0; s < 4; ++s)
-            *p++ = (uint8_t)((int)state.trump == s ? 255 : 0);  // 180-183
+            *p++ = (uint8_t)((int)state.trump == s ? 255 : 0);  // 216-219
 
-        *p++ = (uint8_t)(state.tableLen * 255 / 6);                    // 184
-        *p++ = (uint8_t)(state.undefendedCount() * 255 / 6);          // 185
-        *p++ = (uint8_t)(state.pairsHeadroom() * 255 / 6);            // 186
-        *p++ = (uint8_t)(state.deckRemaining * 255 / 36);             // 187
-        *p++ = (uint8_t)(handSize(state.hands[toIdx(opp)]) * 255 / 36); // 188
-        *p++ = (uint8_t)(handSize(state.hands[toIdx(vp)]) * 255 / 36);  // 189
-        *p++ = state.firstTrick ? 255 : 0;                            // 190
-        *p++ = state.transferEnabled ? 255 : 0;                      // 191
-        *p++ = state.flashEnabled ? 255 : 0;                         // 192
-        *p++ = (state.phase == MatchPhase::Attack) ? 255 : 0;        // 193
-        *p++ = (state.phase == MatchPhase::Defense) ? 255 : 0;       // 194
-        *p++ = (state.turn == vp) ? 255 : 0;                         // 195
-        *p++ = (state.turn == opp) ? 255 : 0;                        // 196
-        *p++ = (state.attacker == vp) ? 255 : 0;                     // 197
-        *p++ = (state.attacker == opp) ? 255 : 0;                    // 198
-        *p++ = (uint8_t)(popCount(oppTaken) * 255 / 36);             // 199: сколько карт забрал opp
+        *p++ = (uint8_t)(state.tableLen * 255 / 6);                    // 220
+        *p++ = (uint8_t)(state.undefendedCount() * 255 / 6);          // 221
+        *p++ = (uint8_t)(state.pairsHeadroom() * 255 / 6);            // 222
+        *p++ = (uint8_t)(state.deckRemaining * 255 / 36);             // 223
+        *p++ = (uint8_t)(handSize(state.hands[toIdx(opp)]) * 255 / 36); // 224
+        *p++ = (uint8_t)(handSize(state.hands[toIdx(vp)]) * 255 / 36);  // 225
+        *p++ = state.firstTrick ? 255 : 0;                            // 226
+        *p++ = state.transferEnabled ? 255 : 0;                      // 227
+        *p++ = state.flashEnabled ? 255 : 0;                         // 228
+        *p++ = (state.phase == MatchPhase::Attack) ? 255 : 0;        // 229
+        *p++ = (state.phase == MatchPhase::Defense) ? 255 : 0;       // 230
+        *p++ = (state.turn == vp) ? 255 : 0;                         // 231
+        *p++ = (state.turn == opp) ? 255 : 0;                        // 232
+        *p++ = (state.attacker == vp) ? 255 : 0;                     // 233
+        *p++ = (state.attacker == opp) ? 255 : 0;                    // 234
+        *p++ = (uint8_t)(popCount(oppTaken) * 255 / 36);             // 235: сколько карт забрал opp
 
-        // Остаток — нули (200..219)
+        // Остаток — нули (236..255)
         while (p < out.data() + kStateSize) *p++ = 0;
 
         auto result = py::array_t<uint8_t>(out.size());

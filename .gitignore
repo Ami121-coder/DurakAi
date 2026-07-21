@@ -38,3 +38,5 @@ desktop.ini
 checkpoints/
 runs/
 *.pt
+durakk_engine
+engine/build/

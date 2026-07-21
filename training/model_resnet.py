@@ -80,7 +80,8 @@ class DurakResNet(nn.Module):
     """
     Усиленная Policy-value сеть для Durak (AlphaZero-style + SE).
 
-    Вход: [B, 220] — 5 масок × 36 карт + 40 скаляров.
+    Task 3: Neural-Bayesian Fusion.
+    Вход: [B, 256] — 6 масок × 36 карт + 40 скаляров.
     Выход: (policy[B, 38], value[B, 1]).
 
     Layout входа (см. bindings.cpp::encodeState):
@@ -89,10 +90,11 @@ class DurakResNet(nn.Module):
       [72..107]  атаки
       [108..143] защиты
       [144..179] бито
-      [180..219] скаляры (40 байт)
+      [180..215] Task 3: байесовские вероятности карт у оппонента (oppProbs)
+      [216..255] скаляры (40 байт)
     """
 
-    NUM_CARD_CHANNELS = 5
+    NUM_CARD_CHANNELS = 6  # Task 3: было 5, стало 6 (добавлен oppProbs)
     CARD_H = 4
     CARD_W = 9
     SCALAR_SIZE = 40
@@ -141,9 +143,13 @@ class DurakResNet(nn.Module):
     def forward(self, x: torch.Tensor,
                 legal_mask: torch.Tensor = None):
         """
-        x:           [B, 220] — uint8 или float
+        Task 3: x — [B, 256] (uint8 или float).
         legal_mask:  [B, 38] — для маскирования policy
         Returns: (policy[B, 38], value[B, 1])
+
+        Layout:
+          [0..215]   = 6 масок × 36 (моя рука, козырь, атаки, защиты, бито, oppProbs)
+          [216..255] = 40 скаляров
         """
         B = x.size(0)
 
@@ -153,11 +159,11 @@ class DurakResNet(nn.Module):
         else:
             x = x.float()
 
-        # Разделяем card masks (5 × 36 = 180) и scalars (40).
-        card_flat = x[:, :180]
-        scalars = x[:, 180:220]
+        # Task 3: card masks (6 × 36 = 216) и scalars (40).
+        card_flat = x[:, :216]
+        scalars = x[:, 216:256]
 
-        # Reshape card masks в [B, 5, 4, 9].
+        # Reshape card masks в [B, 6, 4, 9].
         card_masks = card_flat.view(B, self.NUM_CARD_CHANNELS,
                                      self.CARD_H, self.CARD_W)
 
@@ -207,7 +213,7 @@ if __name__ == "__main__":
     print(f"VRAM (FP16): {model.count_parameters() * 2 / 1024**2:.1f} MB")
 
     B = 4
-    x = torch.rand(B, 220, dtype=torch.float32)
+    x = torch.rand(B, 256, dtype=torch.float32)  # Task 3: 256
     mask = torch.ones(B, 38)
     p, v = model(x, mask)
     print(f"Policy: {p.shape} (ожидалось [{B}, 38])")
@@ -220,7 +226,7 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         device = torch.device("cuda")
         model = model.to(device)
-        x = torch.rand(4096, 220, dtype=torch.float32, device=device)
+        x = torch.rand(4096, 256, dtype=torch.float32, device=device)  # Task 3: 256
         mask = torch.ones(4096, 38, device=device)
         with torch.amp.autocast('cuda'):
             p, v = model(x, mask)

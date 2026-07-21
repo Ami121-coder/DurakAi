@@ -1,18 +1,20 @@
 // ============================================================================
-// onnx_net.cpp — обновлён под новый формат модели (FIX #5)
+// onnx_net.cpp — обновлён под Task 3 (Neural-Bayesian Fusion).
 //
 // Изменения:
-//   1. encodeStateToBuffer теперь использует uint8 → float нормализацию
-//      (значения 0..1 вместо 0..255). Модель ожидает нормализованный вход.
-//   2. value теперь в [-1, 1] (tanh) — приводим к [0, 1] для ISMCTS.
-//   3. Убран мёртвый putMask лямбда-баг.
-//   4. Добавлен козырь one-hot в скаляры (4 байта).
+//   1. kStateSize: 220 → 256 (добавлен 6-й канал oppProbs[36]).
+//   2. encodeStateToBuffer пишет байесовские вероятности в [180..215].
+//   3. Скаляры сдвинуты: [216..255] вместо [180..219].
+//   4. MatchState сам по себе не хранит oppProbs — они берутся из Knowledge.
+//      Поэтому сигнатура encodeStateToBuffer изменена: теперь принимает
+//      const Knowledge& и читает k.oppProbs напрямую.
 // ============================================================================
 
 #include "policy_value_net.h"
 #include "../rules_fast.h"
 #include "../bitboard.h"
 #include "../card.h"
+#include "../knowledge.h"
 
 #include <onnxruntime_cxx_api.h>
 
@@ -27,10 +29,12 @@ namespace durakk {
 
 namespace {
 
-constexpr int kStateSize = 220;
+constexpr int kStateSize = 256;
 constexpr int kActionSize = 38;
 
-void encodeStateToBuffer(const MatchState& s, Player viewpoint, float* out) {
+// Task 3: encodeStateToBuffer теперь принимает Knowledge для доступа к oppProbs.
+void encodeStateToBuffer(const MatchState& s, Player viewpoint,
+                         const Knowledge& k, float* out) {
     Player opp = other(viewpoint);
     float* p = out;
 
@@ -55,29 +59,38 @@ void encodeStateToBuffer(const MatchState& s, Player viewpoint, float* out) {
     writeMask(defMask);                     // [108..143]
     writeMask(s.discard);                   // [144..179]
 
-    // Скаляры [180..219] — нормализованные в [0, 1]
+    // Task 3: 6-й канал — байесовские вероятности карт у оппонента.
+    // [180..215] = 36 float, значения в [0,1].
+    for (int i = 0; i < 36; ++i) {
+        float prob = k.oppProbs[i];
+        if (prob < 0.0f) prob = 0.0f;
+        if (prob > 1.0f) prob = 1.0f;
+        *p++ = prob;
+    }
+
+    // Скаляры [216..255] — нормализованные в [0, 1]
     // Козырь one-hot (4 байта)
     for (int su = 0; su < 4; ++su)
-        *p++ = ((int)s.trump == su) ? 1.0f : 0.0f;  // 180-183
+        *p++ = ((int)s.trump == su) ? 1.0f : 0.0f;  // 216-219
 
-    *p++ = (float)s.tableLen / 6.0f;                              // 184
-    *p++ = (float)s.undefendedCount() / 6.0f;                    // 185
-    *p++ = (float)s.pairsHeadroom() / 6.0f;                      // 186
-    *p++ = (float)s.deckRemaining / 36.0f;                       // 187
-    *p++ = (float)handSize(s.hands[toIdx(opp)]) / 36.0f;         // 188
-    *p++ = (float)handSize(s.hands[toIdx(viewpoint)]) / 36.0f;  // 189
-    *p++ = s.firstTrick ? 1.0f : 0.0f;                           // 190
-    *p++ = s.transferEnabled ? 1.0f : 0.0f;                      // 191
-    *p++ = s.flashEnabled ? 1.0f : 0.0f;                         // 192
-    *p++ = (s.phase == MatchPhase::Attack) ? 1.0f : 0.0f;        // 193
-    *p++ = (s.phase == MatchPhase::Defense) ? 1.0f : 0.0f;       // 194
-    *p++ = (s.turn == viewpoint) ? 1.0f : 0.0f;                  // 195
-    *p++ = (s.turn == opp) ? 1.0f : 0.0f;                        // 196
-    *p++ = (s.attacker == viewpoint) ? 1.0f : 0.0f;              // 197
-    *p++ = (s.attacker == opp) ? 1.0f : 0.0f;                    // 198
-    *p++ = 0.0f;  // 199 (reserved)
+    *p++ = (float)s.tableLen / 6.0f;                              // 220
+    *p++ = (float)s.undefendedCount() / 6.0f;                    // 221
+    *p++ = (float)s.pairsHeadroom() / 6.0f;                      // 222
+    *p++ = (float)s.deckRemaining / 36.0f;                       // 223
+    *p++ = (float)handSize(s.hands[toIdx(opp)]) / 36.0f;         // 224
+    *p++ = (float)handSize(s.hands[toIdx(viewpoint)]) / 36.0f;  // 225
+    *p++ = s.firstTrick ? 1.0f : 0.0f;                           // 226
+    *p++ = s.transferEnabled ? 1.0f : 0.0f;                      // 227
+    *p++ = s.flashEnabled ? 1.0f : 0.0f;                         // 228
+    *p++ = (s.phase == MatchPhase::Attack) ? 1.0f : 0.0f;        // 229
+    *p++ = (s.phase == MatchPhase::Defense) ? 1.0f : 0.0f;       // 230
+    *p++ = (s.turn == viewpoint) ? 1.0f : 0.0f;                  // 231
+    *p++ = (s.turn == opp) ? 1.0f : 0.0f;                        // 232
+    *p++ = (s.attacker == viewpoint) ? 1.0f : 0.0f;              // 233
+    *p++ = (s.attacker == opp) ? 1.0f : 0.0f;                    // 234
+    *p++ = 0.0f;  // 235 (reserved)
 
-    // Остаток — нули (200..219)
+    // Остаток — нули (236..255)
     while (p < out + kStateSize) *p++ = 0.0f;
 }
 
@@ -184,14 +197,14 @@ OnnxNet::OnnxNet(const std::string& onnx_path,
 
 OnnxNet::~OnnxNet() = default;
 
-PVResult OnnxNet::evaluate(const MatchState& s, Player viewpoint) {
+PVResult OnnxNet::evaluate(const MatchState& s, const Knowledge& k, Player viewpoint) {
     if (!ready_) {
-        return RandomNet{}.evaluate(s, viewpoint);
+        return RandomNet{}.evaluate(s, k, viewpoint);
     }
 
     std::array<float, kStateSize> state_buf;
     std::array<float, kActionSize> mask_buf;
-    encodeStateToBuffer(s, viewpoint, state_buf.data());
+    encodeStateToBuffer(s, viewpoint, k, state_buf.data());
     computeLegalMask(s, mask_buf.data());
 
     auto& sess = impl_->session;
@@ -232,10 +245,15 @@ PVResult OnnxNet::evaluate(const MatchState& s, Player viewpoint) {
 }
 
 std::vector<PVResult> OnnxNet::evaluateBatch(const std::vector<MatchState>& states,
+                                             const std::vector<Knowledge>& knowledges,
                                              Player viewpoint) {
     if (!ready_ || states.empty()) {
         std::vector<PVResult> out;
-        for (const auto& s : states) out.push_back(RandomNet{}.evaluate(s, viewpoint));
+        for (size_t i = 0; i < states.size(); ++i) {
+            out.push_back(RandomNet{}.evaluate(states[i],
+                                               knowledges.size() > i ? knowledges[i] : Knowledge{},
+                                               viewpoint));
+        }
         return out;
     }
 
@@ -243,7 +261,8 @@ std::vector<PVResult> OnnxNet::evaluateBatch(const std::vector<MatchState>& stat
     std::vector<float> state_buf(N * kStateSize);
     std::vector<float> mask_buf(N * kActionSize);
     for (int i = 0; i < N; ++i) {
-        encodeStateToBuffer(states[i], viewpoint, state_buf.data() + i * kStateSize);
+        const Knowledge& k = knowledges.size() > (size_t)i ? knowledges[i] : Knowledge{};
+        encodeStateToBuffer(states[i], viewpoint, k, state_buf.data() + i * kStateSize);
         computeLegalMask(states[i], mask_buf.data() + i * kActionSize);
     }
 

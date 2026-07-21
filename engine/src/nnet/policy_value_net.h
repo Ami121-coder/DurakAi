@@ -6,12 +6,14 @@
 //      (для скорости в self-play: один forward на N позиций вместо N forwards).
 //   2. Добавлен класс OnnxNet — реализация через ONNX Runtime (CUDA EP).
 //      Реализация в onnx_net.cpp. Принимает путь к .onnx файлу.
+//   3. Task 3: evaluate() принимает Knowledge — для доступа к oppProbs.
 // ============================================================================
 
 #pragma once
 
 #include "../match.h"
 #include "../move.h"
+#include "../knowledge.h"
 
 #include <memory>
 #include <utility>
@@ -27,15 +29,20 @@ struct PVResult {
 class PolicyValueNet {
 public:
     virtual ~PolicyValueNet() = default;
-    virtual PVResult evaluate(const MatchState& s, Player viewpoint) = 0;
+    // Task 3: добавлен параметр Knowledge — нужен для доступа к oppProbs.
+    virtual PVResult evaluate(const MatchState& s, const Knowledge& k,
+                              Player viewpoint) = 0;
 
     // Батчевая оценка для self-play. Реализация по умолчанию — цикл.
     // OnnxNet переопределит для реального батчинга.
     virtual std::vector<PVResult> evaluateBatch(const std::vector<MatchState>& states,
+                                                const std::vector<Knowledge>& knowledges,
                                                 Player viewpoint) {
         std::vector<PVResult> out;
         out.reserve(states.size());
-        for (const auto& s : states) out.push_back(evaluate(s, viewpoint));
+        for (size_t i = 0; i < states.size(); ++i) {
+            out.push_back(evaluate(states[i], knowledges[i], viewpoint));
+        }
         return out;
     }
 
@@ -45,7 +52,8 @@ public:
 // Заглушка — uniform policy, value = 0.5.
 class RandomNet : public PolicyValueNet {
 public:
-    PVResult evaluate(const MatchState& s, Player viewpoint) override;
+    PVResult evaluate(const MatchState& s, const Knowledge& k,
+                      Player viewpoint) override;
 };
 
 // Реальная сеть через ONNX Runtime + CUDA Execution Provider.
@@ -57,8 +65,10 @@ public:
                      int gpu_device_id = 0);
     ~OnnxNet() override;
 
-    PVResult evaluate(const MatchState& s, Player viewpoint) override;
+    PVResult evaluate(const MatchState& s, const Knowledge& k,
+                      Player viewpoint) override;
     std::vector<PVResult> evaluateBatch(const std::vector<MatchState>& states,
+                                        const std::vector<Knowledge>& knowledges,
                                         Player viewpoint) override;
 
     bool isReady() const { return ready_; }

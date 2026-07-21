@@ -36,7 +36,7 @@ class ReplayBuffer:
 
     def __init__(self,
                  capacity: int = 1_000_000,
-                 state_size: int = 220,
+                 state_size: int = 256,  # Task 3: было 220, стало 256 (oppProbs)
                  action_size: int = 38,
                  prioritized: bool = True,
                  alpha: float = 0.6,        # PER priority exponent
@@ -207,7 +207,7 @@ class ReplayBuffer:
 if __name__ == "__main__":
     # Smoke-test.
     buf = ReplayBuffer(capacity=10_000, prioritized=True)
-    fake_states = np.random.randint(0, 2, size=(100, 220), dtype=np.uint8)
+    fake_states = np.random.randint(0, 2, size=(100, 256), dtype=np.uint8)  # Task 3: 256
     fake_policies = np.random.dirichlet(np.ones(38), size=100).astype(np.float32)
     fake_values = np.random.uniform(-1, 1, size=(100, 1)).astype(np.float32)
     fake_td = np.random.uniform(0.01, 2.0, size=100).astype(np.float32)

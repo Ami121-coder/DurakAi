@@ -34,7 +34,7 @@ def export(checkpoint_path: str, output_path: str,
           f"(blocks={num_blocks}, channels={num_channels})")
 
     # Демонстрационные входы — float32 как из C++ (нормализуем там).
-    state = torch.rand(1, 220, dtype=torch.float32)
+    state = torch.rand(1, 256, dtype=torch.float32)  # Task 3: 256
     legal_mask = torch.ones(1, 38, dtype=torch.float32)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -61,7 +61,7 @@ def export(checkpoint_path: str, output_path: str,
         sess = ort.InferenceSession(output_path, providers=["CPUExecutionProvider"])
 
         # Тест с uint8-like (0..255 как в bindings.cpp, модель нормализует внутри).
-        test_state = (np.random.rand(4, 220) * 255).astype(np.float32)
+        test_state = (np.random.rand(4, 256) * 255).astype(np.float32)  # Task 3: 256
         test_mask = (np.random.rand(4, 38) > 0.3).astype(np.float32)
         out = sess.run(["policy", "value"],
                        {"state": test_state, "legal_mask": test_mask})

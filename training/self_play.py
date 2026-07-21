@@ -322,7 +322,7 @@ class SelfPlayManager:
             masks.append(m)
         if not states:
             return (
-                np.empty((0, 220), dtype=np.uint8),
+                np.empty((0, 256), dtype=np.uint8),  # Task 3: 220 → 256
                 np.empty((0, 38), dtype=np.float32),
                 np.empty((0, 1), dtype=np.float32),
                 np.empty((0, 38), dtype=np.float32),

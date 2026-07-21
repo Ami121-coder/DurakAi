@@ -235,7 +235,7 @@ IsmctsResult runIsmcts(const MatchState& rootState, const Knowledge& knowledge,
     // ---- Корень: оцениваем сетью, создаём всех детей с priors ----
     if (net) {
         MatchState rootDet = determine(rootState, knowledge, viewpoint);
-        PVResult pv = net->evaluate(rootDet, viewpoint);
+        PVResult pv = net->evaluate(rootDet, knowledge, viewpoint);
 
         std::lock_guard<std::mutex> lk(tree.mtx);
         // FIX: НЕ держим ссылку на tree.nodes[0] через emplace_back —
@@ -377,7 +377,7 @@ IsmctsResult runIsmcts(const MatchState& rootState, const Knowledge& knowledge,
                     // ---- Leaf evaluation через сеть ----
                     if (net) {
                         // Оценим child состояние сетью.
-                        PVResult pv = net->evaluate(child, viewpoint);
+                        PVResult pv = net->evaluate(child, knowledge, viewpoint);
                         double value = pv.value;
 
                         // Сохраним priors для будущих детей этого узла.
@@ -435,7 +435,7 @@ IsmctsResult runIsmcts(const MatchState& rootState, const Knowledge& knowledge,
                 // Если есть net, но leaf не был оценен — оценим.
                 // (Это может случиться если достигли глубины без расширения.)
                 if (net) {
-                    PVResult pv = net->evaluate(sim, viewpoint);
+                    PVResult pv = net->evaluate(sim, knowledge, viewpoint);
                     value = pv.value;
                 } else {
                     value = rollout(sim, viewpoint, lim.maxRolloutDepth);
