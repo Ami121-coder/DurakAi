@@ -45,8 +45,15 @@ public:
     // Доступ к сети (чтобы main.cpp мог подменить RandomNet на OnnxNet позже).
     PolicyValueNet* net() { return net_.get(); }
 
+    // True только если загрузилась РЕАЛЬНАЯ нейросеть (OnnxNet с готовой моделью).
+    // RandomNet/заглушка сюда НЕ считаются — в decide() в этом случае передаём
+    // nullptr в ISMCTS, чтобы поиск шёл по чистой математике (UCB1 + rollout),
+    // а не деградировал на uniform priors + value=0.5.
+    bool hasRealNet() const { return hasRealNet_; }
+
 private:
     std::unique_ptr<PolicyValueNet> net_;
+    bool hasRealNet_ = false;
 };
 
 } // namespace durakk

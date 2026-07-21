@@ -1,8 +1,10 @@
 #include "rules_fast.h"
 #include "rules.h" // canBeat
 
-#include <random>
+#include <algorithm>
+#include <cmath>
 #include <climits>
+#include <random>
 
 namespace durakk {
 
@@ -175,7 +177,19 @@ int genLegalMoves(const MatchState& s, MoveBuffer& buf) {
     return 0;
 }
 
-// ============================ Default policy ============================
+// ============================ Default policy (Smart Playout) ============================
+//
+// ЭТАП 1: усиленный rollout для ISMCTS.
+//
+// Старая версия (70% «дешевейший ход» / 30% random) не учитывала:
+//   • парные ранги в руке (выгодно атаковать/переводить тем, что есть в дубле);
+//   • экономию козырей (козырь в playout — слишком «дорогой» обмен);
+//   • ситуацию Take vs Defend (много атак + дорогая защита → лучше Take);
+//   • близость эндшпиля (deckRemaining мало → козыри ценнее, их НЕ сливать).
+//
+// Новый подход: для каждого хода считаем «вес предпочтительности» moveScore(),
+// затем softmax-сэмплинг с температурой. Это даёт и направленность (лучшие ходы
+// выбираются чаще), и разнообразие (не детерминизм, нужное для MCTS-rollout).
 
 namespace {
 
@@ -184,13 +198,142 @@ inline std::mt19937_64& rng() {
     return r;
 }
 
-int cardWeight(Card c, Suit trump, Action a) {
-    // Меньший вес = предпочтительнее в playout.
+// Базовая «стоимость» карты (меньше = предпочтительнее сыграть в playout).
+// Козырь дороже некозырного, защита козырем — ещё дороже.
+int cardCost(Card c, Suit trump, Action a) {
     int base = static_cast<int>(c.rank);
-    int v = base + (c.suit == trump ? 100 : 0);
-    // Защита козырем — особенно «дорогая», поднимем ещё.
-    if (a == Action::Defend && c.suit == trump) v += 50;
-    return v;
+    if (c.suit == trump) base += 100;
+    if (a == Action::Defend && c.suit == trump) base += 50;
+    return base;
+}
+
+// Сколько карт данного ранга в руке (для парных атак/переводов).
+int countRankInHand(CardMask hand, Rank r) {
+    int n = 0;
+    CardMask h = hand;
+    while (h) {
+        CardMask bit = h & (~h + 1);
+        h ^= bit;
+        int idx;
+#if defined(_MSC_VER)
+        unsigned long ul; _BitScanForward64(&ul, bit); idx = (int)ul;
+#else
+        idx = __builtin_ctzll(bit);
+#endif
+        if (indexToCard(idx).rank == r) ++n;
+    }
+    return n;
+}
+
+// Считает число козырей в руке.
+int countTrumpsInHand(CardMask hand, Suit trump) {
+    int n = 0;
+    CardMask h = hand;
+    while (h) {
+        CardMask bit = h & (~h + 1);
+        h ^= bit;
+        int idx;
+#if defined(_MSC_VER)
+        unsigned long ul; _BitScanForward64(&ul, bit); idx = (int)ul;
+#else
+        idx = __builtin_ctzll(bit);
+#endif
+        if (indexToCard(idx).suit == trump) ++n;
+    }
+    return n;
+}
+
+// «Оценка предпочтительности» хода в позиции s. Выше = лучше сыграть.
+// Диапазон условный ~[0, 100]; будет преобразован в softmax-вес.
+float moveScore(const MatchState& s, const Move& m) {
+    const Player cur = s.turn;
+    const CardMask hand = s.hands[toIdx(cur)];
+    const int undefAtk = s.undefendedCount();
+    const bool nearEndgame = s.deckRemaining <= 6;
+    const int myTrumps = countTrumpsInHand(hand, s.trump);
+
+    switch (m.action) {
+
+    // ---------- ЗАЩИТА (Defend) ----------
+    case Action::Defend: {
+        float score = 50.0f;
+        // Младшая некозырная защита — предпочтительнее.
+        int cost = cardCost(m.card, s.trump, m.action);
+        score -= (cost - 6) * 2.0f;            // 6 = младший ранг
+        // Защита козырем — штраф, особенно в эндшпиле или когда козырей мало.
+        if (m.card.suit == s.trump) {
+            score -= nearEndgame ? 25.0f : 15.0f;
+            if (myTrumps <= 2) score -= 15.0f; // последний козырь — не сливай
+        }
+        return score;
+    }
+
+    // ---------- ПЕРЕВООД (Transfer) ----------
+    case Action::Transfer: {
+        float score = 45.0f;
+        // Перевод выгоден, если у соперника (нового защитника) мало карт:
+        // cardsAfter = undefendedCount + 1; если newDefHand < cardsAfter — перевод
+        // вообще невозможен. Если newDefHand лишь чуть больше — перевод давит.
+        int newDefHand = popCount(s.hands[toIdx(s.attacker)]);
+        int cardsAfter = undefAtk + 1;
+        int slack = newDefHand - cardsAfter;
+        if (slack >= 0) score += 8.0f * (3 - std::min(3, slack));
+        // Перевод парной картой — особенно силён (есть дубликат для следующего
+        // перевода или защиты).
+        if (countRankInHand(hand, m.card.rank) >= 2) score += 12.0f;
+        // Перевод козырем — рискованно (теряем козырь).
+        if (m.card.suit == s.trump) {
+            score -= nearEndgame ? 30.0f : 18.0f;
+            if (myTrumps <= 2) score -= 15.0f;
+        }
+        return score;
+    }
+
+    // ---------- ВЗЯТЬ (Take) ----------
+    case Action::Take: {
+        // Take тем выгоднее, чем больше непобитых атак (иначе они уйдут в отбой
+        // бесплатно для атакующего) и чем дороже защита.
+        float score = 20.0f + undefAtk * 8.0f;
+        // Но если есть хоть какая-то дешёвая защита — Take штрафуется.
+        // (Грубая эвристика: если непобитых атак мало, лучше защищаться.)
+        if (undefAtk <= 1) score -= 25.0f;
+        // Близко к концу колоды — брать карты опасно (останутся в руке в эндшпиле).
+        if (nearEndgame) score -= 10.0f;
+        return score;
+    }
+
+    // ---------- АТАКА / ПОДКИДЫВАНИЕ (Attack/Toss) ----------
+    case Action::Attack:
+    case Action::Toss: {
+        float score = 50.0f;
+        // Парные ранги в руке — отлично (можно перевести/подкинуть ещё раз).
+        if (countRankInHand(hand, m.card.rank) >= 2) score += 12.0f;
+        // Младшие карты — предпочтительнее (не жалко потерять).
+        int cost = cardCost(m.card, s.trump, m.action);
+        score -= (cost - 6) * 1.5f;
+        // Атака/подкидывание козырем — почти всегда плохо (теряем козырь в отбой).
+        if (m.card.suit == s.trump) {
+            score -= nearEndgame ? 35.0f : 22.0f;
+            if (myTrumps <= 2) score -= 20.0f;
+        }
+        // Подкидывание старших рангов, которые соперник вряд ли побьёт — хорошо,
+        // если у соперника мало карт (он будет брать). Ориентируемся по размеру
+        // руки соперника в детерминизации.
+        Player opp = other(cur);
+        int oppHand = popCount(s.hands[toIdx(opp)]);
+        if (static_cast<int>(m.card.rank) >= 12 && oppHand <= 3 && m.card.suit != s.trump) {
+            score += 8.0f;
+        }
+        return score;
+    }
+
+    // ---------- БИТО / ПАС (Done/Pass) ----------
+    case Action::Done:
+    case Action::Pass:
+        // Завершаем кон, если все побито — почти всегда хорошо (не даём подкинуть).
+        return (undefAtk == 0) ? 70.0f : 5.0f;
+    }
+    return 30.0f;
 }
 
 } // namespace
@@ -198,33 +341,47 @@ int cardWeight(Card c, Suit trump, Action a) {
 bool defaultPolicy(const MatchState& s, const Move* buf, int n, Move& out) {
     if (n == 0) return false;
 
-    // Лёгкая взвешенная случайность: 70% — выбрать ход с минимальным «весом»
-    // (младшая некозырная), 30% — равномерно случайный. Это баланс между
-    // осмысленностью playout и разнообразием.
-    auto& r = rng();
-    std::uniform_int_distribution<int> coin(0, 9);
+    // Считаем веса через softmax от moveScore.
+    // Температура T: меньше = жёстче следование лучшему ходу.
+    // В rollout нужна умеренная стохастичность → T=1.0 (стандартный softmax).
+    constexpr float T = 1.0f;
 
-    if (coin(r) < 7) {
-        // Выбрать «дешевлейший» ход. Take/Done/Pass считаем нейтральными.
-        int bestIdx = 0;
-        int bestW = INT32_MAX;
-        for (int i = 0; i < n; ++i) {
-            const Move& m = buf[i];
-            if (m.action == Action::Take || m.action == Action::Done ||
-                m.action == Action::Pass) {
-                // Нейтральный вес; в защите слегка неохотно брать.
-                int w = (m.action == Action::Take) ? 30 : 5;
-                if (w < bestW) { bestW = w; bestIdx = i; }
-                continue;
-            }
-            int w = cardWeight(m.card, s.trump, m.action);
-            if (w < bestW) { bestW = w; bestIdx = i; }
-        }
-        out = buf[bestIdx];
-    } else {
-        std::uniform_int_distribution<int> pick(0, n - 1);
-        out = buf[pick(r)];
+    float scores[kMaxMoves];
+    float mx = -1e18f;
+    for (int i = 0; i < n; ++i) {
+        scores[i] = moveScore(s, buf[i]);
+        if (scores[i] > mx) mx = scores[i];
     }
+
+    // softmax: вес_i = exp((s_i - mx) / T). Нормируем для сэмплинга.
+    float weights[kMaxMoves];
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        // Ограничиваем показатель, чтобы не получить overflow/inf.
+        float e = (scores[i] - mx) / T;
+        if (e < -30.0f) e = -30.0f;
+        weights[i] = std::exp(e);
+        sum += weights[i];
+    }
+    if (sum <= 0.0f) {
+        // Фолбэк: равномерный выбор.
+        std::uniform_int_distribution<int> pick(0, n - 1);
+        out = buf[pick(rng())];
+        return true;
+    }
+
+    // Сэмплирование по весам (inverse-CDF).
+    std::uniform_real_distribution<float> u01(0.0f, sum);
+    float r = u01(rng());
+    float acc = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        acc += weights[i];
+        if (r <= acc) {
+            out = buf[i];
+            return true;
+        }
+    }
+    out = buf[n - 1]; // числовая страховка
     return true;
 }
 

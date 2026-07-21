@@ -1,4 +1,26 @@
-torch
-numpy
-tensorboard
-tqdm
+# Python-зависимости для усиленного обучения Durak AlphaZero.
+# Тестировалось на Python 3.12, Windows 11, Ryzen 7500F + RTX 4060 Ti 8GB.
+
+# === PyTorch с CUDA 12.1 ===
+# Ставить через официальный индекс:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.2
+
+# === Численные библиотеки ===
+numpy>=1.24
+
+# === Логирование и визуализация ===
+tensorboard>=2.15
+
+# === Прогресс-бары ===
+tqdm>=4.65
+
+# === ONNX export и inference ===
+onnx>=1.14
+onnxruntime>=1.16
+# Для GPU inference (опционально, для self-play воркеров на CUDA):
+# onnxruntime-gpu>=1.16
+
+# === Pybind11 (для сборки durakk_env) ===
+# Обычно ставится автоматически через CMake FetchContent, но лучше иметь:
+# pybind11>=2.12

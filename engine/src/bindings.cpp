@@ -253,7 +253,12 @@ public:
     }
 
     py::array_t<float> run_ismcts(double time_budget, int num_threads) {
-        Player vp = currentPlayer();
+        // FIX (viewpoint bug): viewpoint должен быть Player::Me ВСЕГДА,
+        // независимо от того, чей сейчас ход. Старый код ставил vp=currentPlayer(),
+        // что означало: когда ходит соперник, ISMCTS maximise ДЛЯ СОПЕРНИКА —
+        // бот отдавал лучшие ходы оппоненту и всегда брал Take (для "выигрыша" Opp).
+        // Теперь ISMCTS всегда maximise для viewpoint = Me.
+        Player vp = Player::Me;
         IsmctsLimits lim;
         lim.timeBudgetSec = time_budget;
         lim.numThreads = std::max(1, num_threads);

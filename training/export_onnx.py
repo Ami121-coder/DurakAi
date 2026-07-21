@@ -1,10 +1,11 @@
 """
-export_onnx.py — обновлён под новую архитектуру модели (FIX #5).
+export_onnx.py — обновлён под усиленную SE-модель.
 
 Изменения:
-  1. dynamic_axes — теперь batch dimension для всех тензоров.
-  2. Проверка что model.eval() вызван (иначе BatchNorm сломает экспорт).
-  3. Sanity check сравнивает PyTorch vs ONNX с uint8 input (как из C++).
+  1. Принимает num_blocks=10, num_channels=256 по умолчанию (как в train.py).
+  2. Проверка model.eval() перед экспортом (важно для BatchNorm).
+  3. Sanity check с uint8 input (как из C++ bindings).
+  4. Dynamic batch axis.
 """
 
 import os
@@ -18,7 +19,7 @@ from model_resnet import build_model
 
 
 def export(checkpoint_path: str, output_path: str,
-           num_blocks: int = 8, num_channels: int = 256,
+           num_blocks: int = 10, num_channels: int = 256,
            opset_version: int = 17):
     device = torch.device("cpu")
 
@@ -29,9 +30,10 @@ def export(checkpoint_path: str, output_path: str,
     else:
         model.load_state_dict(ckpt)
     model.eval()
-    print(f"Модель загружена: {checkpoint_path}")
+    print(f"Модель загружена: {checkpoint_path} "
+          f"(blocks={num_blocks}, channels={num_channels})")
 
-    # Демонстрационные входы — float32 как из C++ (мы нормализуем там)
+    # Демонстрационные входы — float32 как из C++ (нормализуем там).
     state = torch.rand(1, 220, dtype=torch.float32)
     legal_mask = torch.ones(1, 38, dtype=torch.float32)
 
@@ -53,17 +55,19 @@ def export(checkpoint_path: str, output_path: str,
     )
     print(f"ONNX экспортирован: {output_path}")
 
-    # Sanity check
+    # Sanity check.
     try:
         import onnxruntime as ort
         sess = ort.InferenceSession(output_path, providers=["CPUExecutionProvider"])
 
-        test_state = np.random.rand(4, 220).astype(np.float32)
+        # Тест с uint8-like (0..255 как в bindings.cpp, модель нормализует внутри).
+        test_state = (np.random.rand(4, 220) * 255).astype(np.float32)
         test_mask = (np.random.rand(4, 38) > 0.3).astype(np.float32)
         out = sess.run(["policy", "value"],
                        {"state": test_state, "legal_mask": test_mask})
 
         with torch.no_grad():
+            # Модель ожидает uint8 или float; даём float (как в onnx_net.cpp).
             p_torch, v_torch = model(torch.from_numpy(test_state),
                                       torch.from_numpy(test_mask))
         p_diff = np.abs(out[0] - p_torch.numpy()).max()
@@ -73,6 +77,12 @@ def export(checkpoint_path: str, output_path: str,
             print("ПРЕДУПРЕЖДЕНИЕ: расхождения > 1e-3 — проверьте экспорт!")
         else:
             print("OK — ONNX-модель корректна.")
+
+        # Проверим, что нет NaN/Inf.
+        assert np.isfinite(out[0]).all(), "NaN/Inf в policy!"
+        assert np.isfinite(out[1]).all(), "NaN/Inf в value!"
+        print("OK — нет NaN/Inf")
+
     except ImportError:
         print("onnxruntime не установлен — пропускаем sanity check.")
     except Exception as e:
@@ -83,7 +93,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--num_blocks", type=int, default=8)
+    p.add_argument("--num_blocks", type=int, default=10)
     p.add_argument("--num_channels", type=int, default=256)
     p.add_argument("--opset", type=int, default=17)
     args = p.parse_args()
