@@ -32,4 +32,3 @@ desktop.ini
 checkpoints/
 runs/
 *.pt
-onnxruntime_providers_cuda.dll
