@@ -78,6 +78,10 @@ MatchState toMatchState(const GameState& s, const Knowledge& k) {
     // который использовал firstTrickLimit из GameState.
     m.pairsLimit = s.firstTrick ? std::min(s.firstTrickLimit, 5)
                                 : 6;
+
+    // БАГ G (ИСПРАВЛЕН): копируем discard
+    m.discard = k.discard;   // ← ДОБАВЛЕНО
+
     m.attacker = (s.attacker == Side::Me) ? Player::Me : Player::Opp;
     m.turn = (s.turn == Side::Me) ? Player::Me : Player::Opp;
     m.phase = (s.phase == Phase::Attack) ? MatchPhase::Attack : MatchPhase::Defense;

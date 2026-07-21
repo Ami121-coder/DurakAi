@@ -14,9 +14,8 @@
 //      Сеть должна знать какие карты у соперника — это критично для стратегии.
 //
 // Совместимость с onnx_net.cpp: layout остался [0..179] = 5 масок × 36,
-// [180..219] = скаляры. Но добавлен 6-й канал oppTaken в позиции [36..71]
-// (заменил trump, который теперь в [180..215] скалярах как one-hot масти).
-// ВНИМАНИЕ: это меняет формат — требуется переобучение модели.
+// [180..219] = скаляры. [36..71] = trumpMask (козырь). oppKnownTaken — только скаляр
+// popCount в байте 199. Полная маска oppTaken НЕ передаётся.
 // ============================================================================
 
 #include <pybind11/pybind11.h>
@@ -36,9 +35,9 @@ namespace py = pybind11;
 
 namespace durakk {
 
-constexpr int kActionSize = 38;
-constexpr int kActionTake = 36;
-constexpr int kActionDone = 37;
+constexpr int kActionSize = 74;   // 36 atk/toss/def + 36 transfer + take + done
+constexpr int kActionTake = 72;
+constexpr int kActionDone = 73;
 constexpr int kStateSize  = 220;
 
 // ---- Хелпер для экспорта ранга в JSON-совместимый символ ----
@@ -258,14 +257,16 @@ public:
         }
         if (!found) return false;
 
-        // Применим ход.
+        // БАГ D: сохраняем карты стола ДО applyMove
+        CardMask tableBefore = 0;
+        for (int i = 0; i < state.tableLen; ++i) {
+          tableBefore |= cardBit(state.table[i].attack);
+          if (state.table[i].defended)
+            tableBefore |= cardBit(state.table[i].defense);
+        }
+
         if (!applyMove(state, chosen)) return false;
-
-        // ---- FIX #1: синхронизируем Knowledge с state напрямую ----
-        // В self-play у нас ПОЛНАЯ информация. Нет нужды跟踪ить вручную.
-        syncKnowledgeFromState(chosen);
-
-        // Переключаем viewpoint на текущего ходящего.
+        syncKnowledgeFromState(chosen, tableBefore);  // ← передаём tableBefore
         viewpoint = currentPlayer();
 
         return true;
@@ -435,80 +436,30 @@ private:
     int moveToActionIndex(const Move& m) const {
         if (m.action == Action::Take) return kActionTake;
         if (m.action == Action::Done || m.action == Action::Pass) return kActionDone;
+        if (m.action == Action::Transfer) return cardIndex(m.card) + 36;  // ← НОВОЕ
         return cardIndex(m.card);
     }
 
-    // ---- FIX #1: прямая синхронизация Knowledge из state ----
-    // В self-play мы ЗНАЕМ все карты. Просто читаем их из state.
-    // Для UI-бота (где opp рука неизвестна) — Knowledge заполняется из JSON.
-    void syncKnowledgeFromState(const Move& m) {
-        Player vp = viewpoint;  // viewpoint ДО переключения
-
-        // Моя рука — точно знаю.
+    void syncKnowledgeFromState(const Move& m, CardMask tableBeforeTake) {
+        Player vp = viewpoint;
         k.myHand = state.hands[toIdx(vp)];
-
-        // Стол — вижу все карты.
         k.tableKnown = 0;
         for (int i = 0; i < state.tableLen; ++i) {
-            k.tableKnown |= cardBit(state.table[i].attack);
-            if (state.table[i].defended)
-                k.tableKnown |= cardBit(state.table[i].defense);
+          k.tableKnown |= cardBit(state.table[i].attack);
+          if (state.table[i].defended)
+            k.tableKnown |= cardBit(state.table[i].defense);
         }
-
-        // Бито — накапливается в state.discard.
         k.discard = state.discard;
-
-        // Карты соперника: в self-play мы их ВИДИМ (полная информация).
-        // Но для ISMCTS мы должны разделить:
-        //   - oppKnownTaken: карты, которые opp ЗАБРАЛ со стола (видели)
-        //   - unknownPool: карты, которые у opp или в колоде (не видим)
-        //
-        // В self-play после хода Take — мы ВИДЕЛИ какие карты ушли к opp.
-        // После Deal/refill — мы НЕ ВИДЕМ какие карты пришли из колоды.
-        //
-        // Для КОРРЕКТНОСТИ ISMCTS: oppKnownTaken должен содержать только
-        // карты, которые opp взял СО СТОЛА. Карты из колоды — неизвестны.
-        //
-        // Однако в self-play у нас есть полная информация о state.hands[opp].
-        // Мы можем использовать её напрямую для ISMCTS determine():
-        // просто передать k.hands[opp] = state.hands[opp].
-        // Но Knowledge не хранит opp руку явно — только oppHandCount.
-        //
-        // РЕШЕНИЕ: в self-play режиме мы храним opp руку ВНУТРИ Knowledge
-        // через расширение. Но чтобы не менять Knowledge struct, мы просто
-        // обновляем oppHandCount = handSize(state.hands[opp]).
-        // ISMCTS determine() будет семплировать из unknownPool.
-        //
-        // ВАЖНО: это означает что ISMCTS в self-play НЕ ИСПОЛЬЗУЕТ
-        // полную информацию о руке opp — он семплирует. Это КОРРЕКТНО
-        // для обучения (сеть видит ту же информацию что и бот в реальной игре).
         k.oppHandCount = handSize(state.hands[toIdx(other(vp))]);
         k.deckRemaining = state.deckRemaining;
         k.trump = state.trump;
 
-        // oppKnownTaken: обновляем только при Take (когда opp забрал стол).
-        // При других ходах — не трогаем (накапливается).
+        // БАГ D: при Take обновляем oppKnownTaken
         if (m.action == Action::Take) {
-            // Защищающийся (taker) забрал стол. Если taker == opp —
-            // мы видели эти карты, они теперь у opp.
-            Player taker = other(state.attacker);  // taker = ex-defender
-            // После applyMove(Take), state.attacker = attackSide (без изменений).
-            // taker = other(attackSide) = defender.
-            // Но мы уже в syncKnowledgeAfterMove — state обновлён.
-            // exAttacker = state.attacker (он не менялся при Take).
-            // taker = other(state.attacker).
-            if (taker == other(vp)) {
-                // Opp забрал — но мы НЕ видим какие карты пришли из колоды
-                // после refill. Однако карты СО СТОЛА мы видели.
-                // k.tableKnown уже обнулён (стол очищен в applyMove).
-                // Нам нужно восстановить какие карты БЫЛИ на столе.
-                // К сожалению, applyMove уже очистил стол.
-                // РЕШЕНИЕ: для self-play это не критично — ISMCTS всё равно
-                // семплирует. oppKnownTaken используется только для
-                // уменьшения unknownPool. Без него unknownPool будет больше,
-                // но ISMCTS всё равно работает.
-                // Оставляем как есть — при Take не обновляем oppKnownTaken.
-            }
+          Player taker = other(state.attacker);
+          if (taker == other(vp)) {
+            k.oppKnownTaken |= tableBeforeTake;  // ← НОВОЕ
+          }
         }
     }
 };

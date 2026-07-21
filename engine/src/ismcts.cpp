@@ -144,7 +144,8 @@ int puctSelect(const Tree& t, int node, double c, long parentVisits,
     return best;
 }
 
-int ucbSelect(const Tree& t, int node, double c, long parentVisits) {
+int ucbSelect(const Tree& t, int node, double c, long parentVisits,
+              double virtualLossWeight) {
     const Node& n = t.nodes[node];
     int best = -1;
     double bestVal = -1e18;
@@ -153,7 +154,8 @@ int ucbSelect(const Tree& t, int node, double c, long parentVisits) {
         if (ch.visits == 0) return ci;
         double exploit = ch.wins / ch.visits;
         double explore = c * std::sqrt(std::log((double)parentVisits + 1.0) / (double)ch.visits);
-        double v = exploit + explore;
+        double vl = virtualLossWeight * ch.virtualLoss / (double)ch.visits;
+        double v = exploit + explore - vl;   // ← вычитаем virtual loss
         if (v > bestVal) { bestVal = v; best = ci; }
     }
     return best;
@@ -216,6 +218,9 @@ IsmctsResult runIsmcts(const MatchState& rootState, const Knowledge& knowledge,
     Tree tree;
     tree.nodes.emplace_back();
     tree.nodes.back().parent = -1;
+
+    // БАГ O: reserve всегда, не только при net
+    tree.nodes.reserve(1024);   // ← ДОБАВЛЕНО
 
     std::atomic<long> totalPlayouts{0};
     std::atomic<bool> localStop{false};
@@ -301,7 +306,7 @@ IsmctsResult runIsmcts(const MatchState& rootState, const Knowledge& knowledge,
                     if (!doExpand) {
                         chosenChild = net
                             ? puctSelect(tree, cur, lim.puctC, node.visits, lim.virtualLoss)
-                            : ucbSelect(tree, cur, lim.explorationC, node.visits);
+                            : ucbSelect(tree, cur, lim.explorationC, node.visits, lim.virtualLoss);
                         doSelect = chosenChild >= 0;
                     }
                 }

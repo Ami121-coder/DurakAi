@@ -18,7 +18,7 @@ struct SearchCtx {
     Clock::time_point start;
     Clock::time_point deadline;
     long nodes = 0;
-    Player viewpoint;
+    // Player viewpoint;  ← УДАЛЕНО (мёртвое поле)
     bool stopped = false;
 
     bool timeUp() {
@@ -139,7 +139,7 @@ EndgameResult bestEndgameMove(MatchState s, Player viewpoint, const EndgameLimit
     res.move = Move{ Action::Pass, Card{}, Card{}, false, {} };
 
     SearchCtx ctx;
-    ctx.viewpoint = viewpoint;
+    // ctx.viewpoint = viewpoint;  ← УДАЛЕНО
     ctx.start = Clock::now();
     ctx.deadline = ctx.start + std::chrono::milliseconds(static_cast<long long>(lim.timeBudgetSec * 1000));
     if (stopFlag && stopFlag->load()) ctx.stopped = true;

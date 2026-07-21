@@ -264,14 +264,21 @@ std::vector<Card> legalTransferCards(const GameState& s) {
     return out;
 }
 
+// ====================================================================
+// БАГ E (ИСПРАВЛЕН): при пустом столе подкидывать нечего
+// ====================================================================
 std::vector<Card> legalTossCards(const GameState& s) {
-    // По сути то же, что подкидывание в фазе Attack — генерация одинакова.
+    if (s.table.empty()) return {};   // ← ДОБАВЛЕНО
     return legalAttackCards(s);
 }
 
+// ====================================================================
+// БАГ F (ИСПРАВЛЕН): проверка фазы и чей ход
+// ====================================================================
 bool canDeclareDone(const GameState& s) {
     if (s.table.empty()) return false;
-    // Можно завершить, если все атаки побиты (нечего подкидывать обязательно).
+    if (s.phase != Phase::Attack) return false;   // ← ДОБАВЛЕНО
+    if (s.turn != s.attacker) return false;        // ← ДОБАВЛЕНО
     return s.undefendedAttacksCount() == 0;
 }
 
