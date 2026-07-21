@@ -116,7 +116,14 @@ int negamax(MatchState& s, int depth, int alpha, int beta, SearchCtx& ctx) {
     if (best <= origAlpha) flag = 2;       // upper bound
     else if (best >= beta) flag = 1;       // lower bound
     else flag = 0;                          // exact
-    ctx.tt.store(key, { depth, best, flag, bestMove, bestMoveSet });
+    TTEntry entry;
+    entry.depth = depth;
+    entry.value = best;
+    entry.flag = flag;
+    entry.best = bestMove;
+    entry.hasBest = bestMoveSet;
+    entry.generation = ctx.tt.generation();
+    ctx.tt.store(key, entry);
 
     return best;
 }
@@ -134,6 +141,9 @@ EndgameResult bestEndgameMove(MatchState s, Player viewpoint, const EndgameLimit
     ctx.deadline = ctx.start + std::chrono::milliseconds(static_cast<long long>(lim.timeBudgetSec * 1000));
     if (stopFlag && stopFlag->load()) ctx.stopped = true;
 
+    // Task 4: помечаем новую generation — старые записи в TT считаются устаревшими.
+    ctx.tt.newGeneration();
+
     // Итеративное углубление: постепенно увеличиваем глубину, используем лучший
     // ход предыдущей итерации для упорядочивания. Это даёт «лучший за время».
     MoveBuffer rootBuf;
@@ -150,6 +160,11 @@ EndgameResult bestEndgameMove(MatchState s, Player viewpoint, const EndgameLimit
         int alpha = -20000, beta = 20000;
         int bestThis = -20000;
         Move bestMoveThis = bestSoFar;
+
+        // Task 4: упорядочиваем корневые ходы по эвристике + bestSoFar первым.
+        // Это ускоряет сходимость — на каждой итерации отсечения срабатывают раньше.
+        const Move* ttBestPtr = (depth > 1) ? &bestSoFar : nullptr;
+        orderMovesWithTTBest(rootBuf, rootN, s, s.hands[toIdx(s.turn)], ttBestPtr);
 
         for (int i = 0; i < rootN; ++i) {
             if (ctx.timeUp()) break;
