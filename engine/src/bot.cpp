@@ -2,12 +2,15 @@
 
 #include "endgame.h"
 #include "ismcts.h"
+#include "move_ordering.h"  // Task 6: orderMoves для pondering
 #include "rules_fast.h"
 #include "rules.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <random>
+#include <thread>
 
 namespace durakk {
 
@@ -229,6 +232,197 @@ Move Bot::decide(const GameState& s, const Knowledge& k,
         m.reason = buf;
     }
     return m;
+}
+
+// ============================================================================
+// Task 6: Pondering — фоновый предрасчёт ходов на ходе соперника.
+// ============================================================================
+
+Bot::~Bot() {
+    stopPondering();
+}
+
+uint64_t Bot::ponderHash(const GameState& s, const Knowledge& k) {
+    // Упрощённый хеш: myHand + table + trump + turn + phase.
+    // НЕ учитывает deck (он не меняется на ходе соперника, но может
+    // отличаться между двумя вызовами из-за добора — это ок для pondering).
+    uint64_t h = 0x9E3779B97F4A7C15ULL;
+    h ^= k.myHand * 0x100000001B3ULL;
+    h ^= k.tableKnown * 0xC2B2AE3D27D4EB4FULL;
+    h ^= (uint64_t)s.deck.trump << 16;
+    h ^= (uint64_t)s.turn << 24;
+    h ^= (uint64_t)s.phase << 28;
+    h ^= (uint64_t)s.attacker << 32;
+    return h;
+}
+
+void Bot::startPondering(const GameState& s, const Knowledge& k,
+                         const SearchSettings& settings) {
+    // Если уже есть запущенный pondering — остановим.
+    stopPondering();
+
+    // Простая проверка: если у обоих 0 карт и стол пуст — игра окончена.
+    if (s.myHand.empty() && s.oppHandCount == 0 && s.table.empty()) return;
+
+    ponderStopFlag_.store(false);
+    ponderActive_.store(true);
+
+    // Запускаем фоновый поток, который считает ТОП-3 наиболее вероятных
+    // ответа соперника (через ISMCTS с viewpoint=Opp) и для каждого
+    // предрассчитывает наш лучший ход.
+    ponderThread_ = std::thread(&Bot::ponderWorker, this, s, k, settings);
+}
+
+void Bot::ponderWorker(const GameState s, const Knowledge k,
+                       const SearchSettings settings) {
+    // Контекст: тот же матч, но viewpoint = Opp (соперник ходит).
+    // Считаем его ходы, для топ-N предсказаний — наш ответ.
+
+    // Ограничиваем бюджет: не более 80% от основного timeBudget
+    // (чтобы оставить запас CPU для других задач).
+    double ponderBudget = timeoutFor(settings.strength) * 0.8;
+
+    // Сначала: какие ходы может сделать соперник?
+    MatchState root = toMatchState(s, k);
+    MoveBuffer buf;
+    int n = genLegalMoves(root, buf);
+    if (n == 0) {
+        ponderActive_.store(false);
+        return;
+    }
+
+    // Сортируем ходы соперника по эвристике (Task 1) — топ-3 наиболее вероятны.
+    CardMask oppHand = root.hands[toIdx(Player::Opp)];
+    orderMoves(buf, n, root, oppHand);
+
+    int topN = std::min(3, n);
+
+    for (int i = 0; i < topN; ++i) {
+        if (ponderStopFlag_.load()) break;
+
+        // Применяем ход соперника к копии состояния.
+        MatchState afterOpp = root;
+        if (!applyMove(afterOpp, buf[i])) continue;
+
+        // Преобразуем back в GameState для повторного вызова decide().
+        // Это сложно — GameState и MatchState имеют разные структуры.
+        // Поскольку мы внутри Bot, у нас нет публичного API для этого.
+        //
+        // РЕШЕНИЕ: считаем наш лучший ход напрямую через ISMCTS/Endgame
+        // в позиции afterOpp (где уже ход соперника применён).
+        //
+        // ВАЖНО: afterOpp имеет viewpoint=Me (мы ходим следующими).
+
+        // Создаём Knowledge для afterOpp.
+        Knowledge k2 = k;
+        k2.myHand = afterOpp.hands[toIdx(Player::Me)];
+        k2.tableKnown = 0;
+        for (int j = 0; j < afterOpp.tableLen; ++j) {
+            k2.tableKnown |= cardBit(afterOpp.table[j].attack);
+            if (afterOpp.table[j].defended)
+                k2.tableKnown |= cardBit(afterOpp.table[j].defense);
+        }
+        k2.discard = afterOpp.discard;
+        k2.oppHandCount = handSize(afterOpp.hands[toIdx(Player::Opp)]);
+        k2.deckRemaining = afterOpp.deckRemaining;
+        k2.trump = afterOpp.trump;
+        k2.recomputeProbs();
+
+        // Считаем ход через тот же decide() — но БЕЗ рекурсивного pondering.
+        // Поэтому используем внутренний поиск напрямую.
+        DecisionStats stats{};
+        Move ourMove;
+
+        if (afterOpp.deckRemaining == 0) {
+            // Endgame.
+            CardMask pool = k2.unknownPool();
+            afterOpp.hands[toIdx(Player::Opp)] =
+                sampleOppHandForEndgame(pool, k2.oppHandCount);
+            afterOpp.deck = 0;
+            EndgameLimits lim;
+            lim.timeBudgetSec = ponderBudget / std::max(1, topN);
+            EndgameResult er = bestEndgameMove(afterOpp, Player::Me, lim,
+                                                &ponderStopFlag_);
+            ourMove = er.move;
+            stats.mode = "Ponder:Endgame";
+            stats.depthReached = er.depthReached;
+            stats.solved = er.solved;
+            stats.timeMs = er.timeMs;
+            stats.playouts = er.nodes;
+        } else {
+            // ISMCTS.
+            IsmctsLimits lim;
+            lim.timeBudgetSec = ponderBudget / std::max(1, topN);
+            lim.numThreads = settings.numThreads;
+            PolicyValueNet* net = hasRealNet_ ? net_.get() : nullptr;
+            IsmctsResult r = runIsmcts(afterOpp, k2, lim, &ponderStopFlag_,
+                                        Player::Me, net);
+            ourMove = r.move;
+            stats.mode = "Ponder:ISMCTS";
+            stats.playouts = r.playouts;
+            stats.winrate = r.winrate;
+            stats.timeMs = r.timeMs;
+        }
+
+        if (ponderStopFlag_.load()) break;
+
+        // Сохраняем в кеш: ключ = hash состояния afterOpp.
+        // При checkPonderCache(s_new, k_new) мы вычислим hash для s_new
+        // и сравним — если совпал, вернём ourMove.
+        uint64_t h = 0;
+        h ^= k2.myHand * 0x100000001B3ULL;
+        h ^= k2.tableKnown * 0xC2B2AE3D27D4EB4FULL;
+        h ^= (uint64_t)afterOpp.trump << 16;
+        h ^= (uint64_t)afterOpp.turn << 24;
+        h ^= (uint64_t)afterOpp.phase << 28;
+        h ^= (uint64_t)afterOpp.attacker << 32;
+
+        PonderEntry entry;
+        entry.move = ourMove;
+        entry.stats = stats;
+        entry.predictedStateHash = h;
+
+        {
+            std::lock_guard<std::mutex> lk(ponderMtx_);
+            // Ограничиваем кеш 32 записями — больше не нужно.
+            if (ponderCache_.size() > 32) ponderCache_.clear();
+            ponderCache_[h] = entry;
+        }
+    }
+
+    ponderActive_.store(false);
+}
+
+Move Bot::checkPonderCache(const GameState& s, const Knowledge& k,
+                            DecisionStats* statsOut) {
+    uint64_t h = ponderHash(s, k);
+    std::lock_guard<std::mutex> lk(ponderMtx_);
+    auto it = ponderCache_.find(h);
+    if (it == ponderCache_.end()) {
+        // Нет попадания в кеш.
+        if (statsOut) statsOut->mode = "Ponder:MISS";
+        return Move{ Action::Pass, Card{}, Card{}, false, {} };
+    }
+
+    // Попадание! Возвращаем предрассчитанный ход.
+    if (statsOut) *statsOut = it->second.stats;
+    if (statsOut) statsOut->timeMs = 0.0;  // мгновенно
+    Move m = it->second.move;
+
+    // Очищаем кеш после использования (предсказание одноразовое).
+    ponderCache_.erase(it);
+
+    return m;
+}
+
+void Bot::stopPondering() {
+    ponderStopFlag_.store(true);
+    if (ponderThread_.joinable()) {
+        ponderThread_.join();
+    }
+    ponderActive_.store(false);
+    std::lock_guard<std::mutex> lk(ponderMtx_);
+    ponderCache_.clear();
 }
 
 } // namespace durakk
