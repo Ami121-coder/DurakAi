@@ -20,6 +20,7 @@
 #include "rules.h"
 #include "threadpool.h"
 #include "nnet/policy_value_net.h"
+#include "move_ordering.h"  // Task 1: progressive bias / move ordering
 
 #include <algorithm>
 #include <chrono>
@@ -119,6 +120,15 @@ struct Node {
     double cachedValue = 0.5;       // value из сети (для leaf eval)
     // FIX #4: кеш политики для детей
     std::unordered_map<Move, double, MoveHash, MoveEq> childPriors;
+    // Task 1: эвристический prior (вычисляется один раз при создании узла).
+    // Используется в progressive bias для UCB1 (без сети) и как fallback prior
+    // в PUCT, если сеть не дала prior для этого ребёнка.
+    double heuristicPrior = 0.5;
+    // Task 1: состояние, для которого считался heuristicPrior (нужно для пересчёта
+    // при использовании move ordering в select). Храним только нужные поля.
+    CardMask heuristicHand = 0;  // рука ходящего в позиции-родителе
+    MatchPhase heuristicPhase = MatchPhase::Attack;
+    Suit heuristicTrump = Suit::Spades;
 };
 
 struct Tree {
@@ -135,10 +145,20 @@ int puctSelect(const Tree& t, int node, double c, long parentVisits,
         const Node& ch = t.nodes[ci];
         if (ch.visits == 0) return ci;
         double exploit = ch.wins / (double)ch.visits;
-        double explore = c * ch.prior *
+        // Task 1: если prior почти нулевой (сеть неуверенна), подмешиваем эвристику.
+        // Это даёт softer fallback на ранних итерациях для не-root узлов без priors.
+        double effectivePrior = ch.prior;
+        if (ch.prior < 1e-3) {
+            effectivePrior = ch.heuristicPrior;
+        }
+        double explore = c * effectivePrior *
             std::sqrt((double)parentVisits + 1.0) / (1.0 + (double)ch.visits);
+        // Task 1: progressive bias — дополнительный бонус на основе эвристики.
+        // bonus = k * heuristicPrior / (1 + visits)
+        // Убывает с ростом визитов (по мере накопления стат. данных эвристика уступает).
+        double pbias = kProgressiveBiasC * ch.heuristicPrior / (1.0 + (double)ch.visits);
         double vl = virtualLossWeight * ch.virtualLoss / (double)ch.visits;
-        double v = exploit + explore - vl;
+        double v = exploit + explore + pbias - vl;
         if (v > bestVal) { bestVal = v; best = ci; }
     }
     return best;
@@ -153,7 +173,12 @@ int ucbSelect(const Tree& t, int node, double c, long parentVisits) {
         if (ch.visits == 0) return ci;
         double exploit = ch.wins / ch.visits;
         double explore = c * std::sqrt(std::log((double)parentVisits + 1.0) / (double)ch.visits);
-        double v = exploit + explore;
+        // Task 1: progressive bias — главный источник «интеллекта» без сети.
+        // bonus = k * heuristicPrior / (1 + visits)
+        // На ранних итерациях (visits<10) даёт большой буст качественным ходам.
+        // По мере накопления визитов — эвристика уступает место статистике.
+        double pbias = kProgressiveBiasC * ch.heuristicPrior / (1.0 + (double)ch.visits);
+        double v = exploit + explore + pbias;
         if (v > bestVal) { bestVal = v; best = ci; }
     }
     return best;
@@ -238,6 +263,10 @@ IsmctsResult runIsmcts(const MatchState& rootState, const Knowledge& knowledge,
         tree.nodes.reserve(pv.policy.size() + 16);
         tree.nodes[0].evaluated = true;
         tree.nodes[0].cachedValue = pv.value;
+        // Task 1: контекст эвристики для корня.
+        tree.nodes[0].heuristicHand = rootDet.hands[toIdx(rootDet.turn)];
+        tree.nodes[0].heuristicPhase = rootDet.phase;
+        tree.nodes[0].heuristicTrump = rootDet.trump;
 
         for (auto& [mv, prior] : pv.policy) {
             MatchState child = rootDet;
@@ -247,6 +276,13 @@ IsmctsResult runIsmcts(const MatchState& rootState, const Knowledge& knowledge,
             ch.parent = 0;
             ch.move = mv;
             ch.prior = prior;
+            // Task 1: считаем эвристический prior один раз.
+            // Hand = рука ходящего в КОРНЕ (до применения mv).
+            ch.heuristicPrior = moveHeuristic(rootDet, mv,
+                                              rootDet.hands[toIdx(rootDet.turn)]);
+            ch.heuristicHand = rootDet.hands[toIdx(rootDet.turn)];
+            ch.heuristicPhase = rootDet.phase;
+            ch.heuristicTrump = rootDet.trump;
             int newIdx = (int)tree.nodes.size() - 1;
             tree.nodes[0].children.push_back(newIdx);
             tree.nodes[0].expandedMoves.insert(mv);
@@ -256,6 +292,14 @@ IsmctsResult runIsmcts(const MatchState& rootState, const Knowledge& knowledge,
             addDirichletToRoot(tree, lim.dirichletAlpha, lim.dirichletEps);
         }
         res.rootValue = pv.value;
+    } else {
+        // Task 1: без сети — корень не имеет priors, но дети получат heuristicPrior
+        // при первом расширении. Инициализируем контекст эвристики для корня.
+        MatchState rootDet = determine(rootState, knowledge, viewpoint);
+        std::lock_guard<std::mutex> lk(tree.mtx);
+        tree.nodes[0].heuristicHand = rootDet.hands[toIdx(rootDet.turn)];
+        tree.nodes[0].heuristicPhase = rootDet.phase;
+        tree.nodes[0].heuristicTrump = rootDet.trump;
     }
 
     int nThreads = std::max(1, lim.numThreads);
@@ -314,6 +358,10 @@ IsmctsResult runIsmcts(const MatchState& rootState, const Knowledge& knowledge,
                     }
 
                     double prior = 1.0 / (double)n;  // default
+                    double heuristicPrior = 0.5;     // Task 1: default
+                    CardMask heuristicHand = sim.hands[toIdx(sim.turn)];
+                    MatchPhase heuristicPhase = sim.phase;
+                    Suit heuristicTrump = sim.trump;
                     {
                         std::lock_guard<std::mutex> lk(tree.mtx);
                         Node& parent = tree.nodes[cur];
@@ -321,6 +369,10 @@ IsmctsResult runIsmcts(const MatchState& rootState, const Knowledge& knowledge,
                         if (it != parent.childPriors.end()) {
                             prior = it->second;
                         }
+                        // Task 1: считаем эвристический prior для нового узла.
+                        // Используем sim (состояние ДО применения expandMove).
+                        heuristicPrior = moveHeuristic(sim, expandMove,
+                                                       sim.hands[toIdx(sim.turn)]);
                     }
 
                     int newIdx;
@@ -331,6 +383,11 @@ IsmctsResult runIsmcts(const MatchState& rootState, const Knowledge& knowledge,
                         c.parent = cur;
                         c.move = expandMove;
                         c.prior = prior;
+                        // Task 1: сохраняем эвристику и контекст для будущих пересчётов.
+                        c.heuristicPrior = heuristicPrior;
+                        c.heuristicHand = heuristicHand;
+                        c.heuristicPhase = heuristicPhase;
+                        c.heuristicTrump = heuristicTrump;
                         newIdx = (int)tree.nodes.size() - 1;
                         tree.nodes[cur].children.push_back(newIdx);
                     }

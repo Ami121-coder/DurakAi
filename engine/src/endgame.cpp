@@ -2,6 +2,7 @@
 #include "rules_fast.h"
 #include "bitboard.h"
 #include "card.h"
+#include "move_ordering.h"  // Task 1: move ordering в α-β
 
 #include <algorithm>
 #include <chrono>
@@ -84,21 +85,10 @@ int negamax(MatchState& s, int depth, int alpha, int beta, SearchCtx& ctx) {
     // вернём 0 как «ничья», чтобы не зациклиться.
     if (n == 0) return 0;
 
-    // Упорядочивание: TT-best ход первым.
-    // FIX #13: в старом коде цикл с break на i=0 просто менял buf[0] с buf[0]
-    // местами — упорядочивание не работало. Теперь ищем TT-best ход в списке
-    // и ставим его на первую позицию.
-    if (e && e->hasBest) {
-        for (int i = 0; i < n; ++i) {
-            if (buf[i].action == e->best.action &&
-                buf[i].card == e->best.card &&
-                buf[i].hasTarget == e->best.hasTarget &&
-                (!buf[i].hasTarget || buf[i].target == e->best.target)) {
-                if (i != 0) std::swap(buf[0], buf[i]);
-                break;
-            }
-        }
-    }
+    // Task 1: упорядочивание ходов по доменной эвристике + TT-best первым.
+    // Достаём TT-best (если есть) и передаём в orderMovesWithTTBest.
+    const Move* ttBestPtr = (e && e->hasBest) ? &e->best : nullptr;
+    orderMovesWithTTBest(buf, n, s, s.hands[toIdx(s.turn)], ttBestPtr);
 
     int origAlpha = alpha;
     int best = -20000;
