@@ -1,6 +1,7 @@
 #include "bot.h"
 
 #include "endgame.h"
+#include "endgame_db.h"  // Task 7
 #include "ismcts.h"
 #include "move_ordering.h"  // Task 6: orderMoves для pondering
 #include "rules_fast.h"
@@ -133,6 +134,35 @@ Move Bot::decide(const GameState& s, const Knowledge& k,
                  const SearchSettings& settings, DecisionStats* statsOut) {
     DecisionStats stats{};
     MatchState root = toMatchState(s, k);
+
+    // ---------- Task 7: Endgame Database O(1) lookup ----------
+    // Если загружена БД и позиция подходит (deck=0, стол пуст, суммарно ≤4 карт),
+    // возвращаем предрассчитанный ход мгновенно.
+    if (endgameDB_.isReady() && s.deck.remaining == 0 && s.table.empty()) {
+        int totalCards = static_cast<int>(s.myHand.size()) + s.oppHandCount;
+        if (totalCards <= 4) {
+            EndgameDBEntry e = endgameDB_.lookup(root);
+            if (e.bestCardIdx != 0xFF) {
+                // Восстанавливаем Move из entry.
+                Move m;
+                m.action = static_cast<Action>(e.action);
+                if (e.bestCardIdx < 36) {
+                    m.card = indexToCard(e.bestCardIdx);
+                }
+                if (e.targetCardIdx != 0xFF && e.targetCardIdx < 36) {
+                    m.target = indexToCard(e.targetCardIdx);
+                    m.hasTarget = true;
+                }
+                m.reason = "EndgameDB: O(1) lookup";
+
+                stats.mode = "EndgameDB";
+                stats.timeMs = 0.0;
+                stats.solved = (e.result == 1 || e.result == 2);
+                if (statsOut) *statsOut = stats;
+                return m;
+            }
+        }
+    }
 
     // ---------- Эндшпиль: колода пуста → minimax α-β (perfect information) ----------
     if (s.deck.remaining == 0) {
@@ -423,6 +453,22 @@ void Bot::stopPondering() {
     ponderActive_.store(false);
     std::lock_guard<std::mutex> lk(ponderMtx_);
     ponderCache_.clear();
+}
+
+// ============================================================================
+// Task 7: Endgame Database API
+// ============================================================================
+
+bool Bot::loadEndgameDB(const std::string& path) {
+    bool ok = endgameDB_.load(path);
+    if (ok) {
+        std::fprintf(stderr, "[Bot] EndgameDB загружена: %zu записей из %s\n",
+                     endgameDB_.size(), path.c_str());
+    } else {
+        std::fprintf(stderr, "[Bot] Не удалось загрузить EndgameDB из %s\n",
+                     path.c_str());
+    }
+    return ok;
 }
 
 } // namespace durakk

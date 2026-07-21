@@ -29,6 +29,7 @@
 #include "knowledge.h"
 #include "ismcts.h"
 #include "nnet/policy_value_net.h"
+#include "endgame_db.h"  // Task 7
 #include <random>
 #include <vector>
 
@@ -579,6 +580,18 @@ PYBIND11_MODULE(durakk_env, m) {
         .def("get_stats", &DurakEnv::getStats)
         // FIX strict_arena: экспорт полного состояния для синхронизации арены.
         .def("get_state_snapshot", &DurakEnv::getStateSnapshot);
+
+    // Task 7: Endgame Database.
+    m.def("build_endgame_db", [](const std::string& path, int maxTotal) {
+        EndgameDB db;
+        size_t n = buildEndgameDB(db, maxTotal);
+        if (!db.save(path)) {
+            throw std::runtime_error("Не удалось сохранить EndgameDB в " + path);
+        }
+        return n;
+    }, py::arg("path"), py::arg("max_total") = 4,
+       "Построить Endgame Database и сохранить в файл. Возвращает число записей.");
+
     m.attr("ACTION_SIZE") = kActionSize;
     m.attr("ACTION_TAKE") = kActionTake;
     m.attr("ACTION_DONE") = kActionDone;

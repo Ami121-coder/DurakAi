@@ -90,6 +90,7 @@ set(ENGINE_SOURCES
     src/bot.cpp
     src/ismcts.cpp
     src/endgame.cpp
+    src/endgame_db.cpp
     src/ttable.cpp
     src/nnet/random_net.cpp
     src/protocol.cpp
@@ -140,6 +141,7 @@ set(ENV_SOURCES
     src/bot.cpp
     src/ismcts.cpp
     src/endgame.cpp
+    src/endgame_db.cpp
     src/ttable.cpp
     src/nnet/random_net.cpp
 )

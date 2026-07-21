@@ -5,6 +5,7 @@
 #include "match.h"
 #include "move.h"
 #include "nnet/policy_value_net.h"
+#include "endgame_db.h"  // Task 7
 
 #include <atomic>
 #include <memory>
@@ -67,9 +68,20 @@ public:
                           DecisionStats* statsOut = nullptr);
     void stopPondering();
 
+    // Task 7: Endgame Database API.
+    // Загрузить БД из бинарного файла (построенного build_endgame_db).
+    // После загрузки decide() будет использовать O(1) lookup для эндшпилей
+    // с суммарно ≤4 карт при deck=0.
+    bool loadEndgameDB(const std::string& path);
+    bool hasEndgameDB() const { return endgameDB_.isReady(); }
+    size_t endgameDBSize() const { return endgameDB_.size(); }
+
 private:
     std::unique_ptr<PolicyValueNet> net_;
     bool hasRealNet_ = false;
+
+    // Task 7: Endgame Database.
+    EndgameDB endgameDB_;
 
     // Task 6: Pondering state.
     struct PonderEntry {
