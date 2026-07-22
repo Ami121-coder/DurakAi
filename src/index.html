@@ -2,85 +2,77 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>Дурак AI — Советник</title>
+    <title>Дурак AI — трекер партии</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <header>
-        <h1>🃏 Дурак AI</h1>
-        <span id="engine-status">движок: загрузка...</span>
-    </header>
+<header>
+    <h1>🃏 Дурак AI <small>трекер + авто-совет</small></h1>
+    <span id="advice" class="advice-box">—</span>
+</header>
 
-    <main>
-        <!-- Моя рука -->
-        <section>
-            <h2>Моя рука</h2>
-            <div id="my-hand" class="card-grid"></div>
-        </section>
+<main>
+    <!-- ИНФО-ПАНЕЛЬ (всё считается автоматически) -->
+    <section class="info-bar">
+        <div>🂠 Колода: <b id="i-deck">24</b></div>
+        <div> У соперника: <b id="i-opp">6</b></div>
+        <div>🗑 Сброс: <b id="i-discard">0</b></div>
+        <div id="i-phase">⚔ атака</div>
+        <div>Ходит: <b id="i-attacker">Я</b></div>
+        <div>Лимит пар: <b id="i-limit">5</b></div>
+    </section>
+    <div id="hand-warn" class="warn"></div>
 
-        <!-- Параметры -->
-        <section class="params">
-            <div>
-                <label>Козырь:</label>
-                <button class="trump-btn" data-suit="clubs">♣</button>
-                <button class="trump-btn" data-suit="diamonds">♦</button>
-                <button class="trump-btn" data-suit="hearts">♥</button>
-                <button class="trump-btn" data-suit="spades">♠</button>
-            </div>
-            <div>
-                <label>Колода (ост.):</label>
-                <input type="number" id="deck-count" value="24" min="0" max="36">
-            </div>
-            <div>
-                <label>Карт у соперника:</label>
-                <input type="number" id="opp-count" value="6" min="0" max="36">
-            </div>
-            <div>
-                <label>Фаза:</label>
-                <select id="phase-select">
-                    <option value="attack">Атака</option>
-                    <option value="defend">Защита</option>
-                </select>
-            </div>
-            <div>
-                <label>Атакующий:</label>
-                <select id="attacker-select">
-                    <option value="0">Я (бот)</option>
-                    <option value="1">Соперник</option>
-                </select>
-            </div>
-            <div>
-                <label>
-                    <input type="checkbox" id="first-trick"> Первый кон (лимит 5)
-                </label>
-            </div>
-        </section>
+    <!-- РЕЖИМ КЛИКА ПО ПАЛИТРЕ -->
+    <section class="modes">
+        <span>Клик по карте =</span>
+        <button data-mode="hand"     class="active">🖐 в руку / из руки</button>
+        <button data-mode="myPlace">🃏 я кладу на стол</button>
+        <button data-mode="oppPlace">🃏 соперник кладёт</button>
+        <button data-mode="transfer">🔁 перевод</button>
+        <button data-mode="pursue">⤵ вдогонку</button>
+    </section>
 
-        <!-- Стол -->
-        <section>
-            <h2>Стол</h2>
-            <div id="table-pairs"></div>
-            <div class="add-pair-row">
-                <input id="atk-input" placeholder="атака: 7 clubs" size="12">
-                <input id="def-input" placeholder="защита: K clubs" size="12">
-                <button id="add-pair">＋ пара</button>
-            </div>
-        </section>
+    <!-- ПАЛИТРА 36 КАРТ -->
+    <section id="palette" class="palette"></section>
 
-        <!-- Кнопки -->
-        <section class="actions">
-            <button id="btn-advice" class="btn-primary">🧠 Получить совет</button>
-            <button id="btn-legal" class="btn-secondary">📋 Легальные ходы</button>
-        </section>
+    <!-- КОЗЫРЬ + РОЛЬ -->
+    <section class="row">
+        <span>Козырь:</span>
+        <button data-trump="0">♣</button>
+        <button data-trump="1">♦</button>
+        <button data-trump="2">♥</button>
+        <button data-trump="3">♠</button>
+        <span class="gap">Атакующий сейчас:</span>
+        <button data-att="0">Я</button>
+        <button data-att="1">Соперник</button>
+    </section>
 
-        <!-- Результат -->
-        <section>
-            <div id="status"></div>
-            <div id="result"></div>
-            <div id="legal-moves" class="legal-list"></div>
-        </section>
-    </main>
+    <!-- СТОЛ -->
+    <section>
+        <h3>Стол</h3>
+        <div id="table" class="table"></div>
+    </section>
 
-    <script src="renderer.js"></script>
+    <!-- ДЕЙСТВИЯ ПАРТИИ -->
+    <section class="actions">
+        <button id="btn-deal"  class="g">🎲 Новая раздача</button>
+        <button id="btn-bito"  class="b">✅ Бито</button>
+        <button id="btn-take-me"  class="r">📥 Я беру</button>
+        <button id="btn-take-opp" class="r">📥 Соперник берёт</button>
+        <button id="btn-pursue-done" class="y" style="display:none">⏭ Вдогонку закончена → добор</button>
+        <button id="btn-undo"  class="k">↶ Undo</button>
+    </section>
+
+    <!-- СОВЕТ -->
+    <section class="actions">
+        <button id="btn-advice" class="g">🧠 Совет сейчас</button>
+        <button id="btn-legal"  class="k">📋 Легальные ходы</button>
+        <label><input type="checkbox" id="chk-auto" checked> авто-совет после каждого действия</label>
+    </section>
+</main>
+
+<div id="toast" class="toast"></div>
+<script src="renderer.js"></script>
 </body>
 </html>
