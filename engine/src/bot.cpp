@@ -1,199 +1,204 @@
 #include "bot.h"
-
-#include "endgame.h"
-#include "ismcts.h"
-#include "rules_fast.h"
-#include "rules.h"
-
+#include "bitboard.h"
+#include "mcts.h"
+#include "gpu_engine.h"
+#include <cmath>
+#include <cstring>
 #include <algorithm>
+#include <vector>
+#include <chrono>
 #include <cstdio>
-#include <random>
+
+// ============================================================
+// Глобальные объекты (живут на время процесса)
+// ============================================================
+static GpuEngine g_gpu;
+static MctsEngine g_mcts;
+static bool g_initialized = false;
+static float g_bayesWeights[36]; // байесовские веса для семплинга
+
+// Параметры оценки (тюнятся CMA-ES или вручную)
+static EvalParams g_evalParams = {
+    .w_hand_count   = 3.0f,
+    .w_trump_count  = 5.0f,
+    .w_high_trump   = 8.0f,
+    .w_rank_spread  = 2.0f,
+    .w_low_cards    = 1.5f,
+    .w_opp_trumps   = 4.0f,
+    .w_deck_factor  = 0.5f,
+    .w_table_control = 3.0f
+};
+
+// ============================================================
+// Инициализация (вызывается один раз при старте)
+// ============================================================
+static void ensureInit() {
+    if (g_initialized) return;
+
+    // Инициализация GPU
+    if (g_gpu.init(0)) {
+        g_gpu.setEvalParams(g_evalParams);
+        printf("[Bot] GPU initialized successfully\n");
+    } else {
+        printf("[Bot] GPU init failed, falling back to CPU-only\n");
+    }
+
+    // Инициализация MCTS
+    MctsConfig cfg;
+    cfg.maxIterations = 500000;
+    cfg.gpuBatchSize = 262144;      // 256K rollout'ов за батч
+    cfg.gpuRolloutsPerLeaf = 64;
+    cfg.ucbC = 1.41f;
+    cfg.evalWeight = 0.3f;
+    cfg.maxTreeNodes = 2000000;     // ~128 MB RAM (32 GB DDR5 позволяет)
+    cfg.timeLimitMs = 4500;         // 4.5 сек на ход
+    cfg.cpuThreads = 10;            // 7500F: 12 потоков, 2 на систему
+
+    g_mcts.init(&g_gpu);
+    g_mcts.setConfig(cfg);
+
+    // Инициализация байесовских весов (равномерные)
+    for (int i = 0; i < 36; ++i) g_bayesWeights[i] = 1.0f;
+
+    g_initialized = true;
+    printf("[Bot] MCTS engine ready (GPU: %s)\n", g_gpu.isReady() ? "ON" : "OFF");
+}
+
+// ============================================================
+// Обновление байесовских весов по истории ходов
+// ============================================================
+static void updateBayesWeights(const durakk::GameState& state) {
+    // Карты, которые точно НЕ у соперника:
+    // - наши карты
+    // - карты на столе
+    // - карты, которые соперник не смог побить (вероятно нет)
+    uint64_t knownNotOpp = 0;
+
+    // Наши карты
+    for (auto& c : state.hands[0]) { // bot = player 0
+        knownNotOpp |= bb::cardBit(c.rank, static_cast<int>(c.suit));
+    }
+
+    // Стол
+    for (auto& p : state.table) {
+        knownNotOpp |= bb::cardBit(p.attack.rank, static_cast<int>(p.attack.suit));
+        if (p.defended)
+            knownNotOpp |= bb::cardBit(p.defense.rank, static_cast<int>(p.defense.suit));
+    }
+
+    // Обновляем веса: известные карты → вес 0
+    for (int i = 0; i < 36; ++i) {
+        if (knownNotOpp & (1ULL << i)) {
+            g_bayesWeights[i] = 0.0f;
+        } else {
+            // Базовый вес + бонус за "вероятность"
+            g_bayesWeights[i] = 1.0f;
+        }
+    }
+
+    // Эвристика: если соперник не побил карту ранга R — вероятно нет карт ранга R+
+    for (auto& p : state.table) {
+        if (!p.defended) { // не побита
+            int atkRank = p.attack.rank;
+            for (int r = atkRank; r <= 14; ++r) {
+                for (int s = 0; s < 4; ++s) {
+                    int idx = bb::cardIndex(r, s);
+                    g_bayesWeights[idx] *= 0.5f;
+                }
+            }
+        }
+    }
+}
 
 namespace durakk {
 
-namespace {
-
-// Локальный weighted sampling руки соперника для эндшпиля.
-// Когда колода пуста (deckRemaining==0), все карты unknownPool физически
-// находятся у соперника — но из-за возможных ошибок трекинга Knowledge
-// popCount(unknownPool) может не совпадать с k.oppHandCount. Поэтому:
-//   • если совпадает точно — берём все (идеальный случай);
-//   • если неизвестных больше, чем нужно — сэмплируем oppHandCount штук;
-//   • если меньше — берём сколько есть.
-CardMask sampleOppHandForEndgame(CardMask pool, int need) {
-    int n = popCount(pool);
-    if (n == 0 || need <= 0) return 0;
-    if (need >= n) return pool;  // все неизвестные = у соперника
-
-    int idx[36];
-    int cnt = 0;
-    CardMask p = pool;
-    while (p) {
-        CardMask bit = p & (~p + 1);
-        p ^= bit;
-        int i;
-#if defined(_MSC_VER)
-        unsigned long ul; _BitScanForward64(&ul, bit); i = (int)ul;
-#else
-        i = __builtin_ctzll(bit);
-#endif
-        idx[cnt++] = i;
-    }
-    static thread_local std::mt19937_64 rng{ std::random_device{}() };
-    for (int i = 0; i < need; ++i) {
-        int j = i + (int)(rng() % (unsigned)(cnt - i));
-        std::swap(idx[i], idx[j]);
-    }
-    CardMask out = 0;
-    for (int i = 0; i < need; ++i) out |= (uint64_t(1) << idx[i]);
-    return out;
-}
-
-// Параметры силы → таймаут.
-double timeoutFor(Strength s) {
-    switch (s) {
-        case Strength::Fast:   return 0.5;
-        case Strength::Normal: return 2.0;
-        case Strength::Deep:   return 10.0;
-    }
-    return 2.0;
-}
-
-// Построить MatchState из GameState (наблюдаемой позиции).
-// Рука соперника и колода здесь — заглушки (0); реальное их содержание добавляет
-// ISMCTS через determine() в каждой симуляции.
-MatchState toMatchState(const GameState& s, const Knowledge& k) {
-    MatchState m{};
-    m.trump = s.deck.trump;
-    m.hands[0] = k.myHand;       // рука бота
-    m.hands[1] = 0;              // соперник — неизвестен (ISMCTS раздасm)
-    m.deck = 0;
-    m.deckRemaining = s.deck.remaining;
-    m.firstTrick = s.firstTrick;
-    m.transferEnabled = s.transferEnabled;
-    m.flashEnabled = s.flashEnabled;
-    // FIX #18: пробрасываем пользовательскую настройку лимита первого кона.
-    // Раньше хардкодилось pairsLimit = 6, а firstTrick ? 5 тоже хардкодилось
-    // в pairsHeadroom() — это расходилось с rules.cpp::maxPairsThisTrick,
-    // который использовал firstTrickLimit из GameState.
-    m.pairsLimit = s.firstTrick ? std::min(s.firstTrickLimit, 5)
-                                : 6;
-
-    // БАГ G (ИСПРАВЛЕН): копируем discard
-    m.discard = k.discard;   // ← ДОБАВЛЕНО
-
-    m.attacker = (s.attacker == Side::Me) ? Player::Me : Player::Opp;
-    m.turn = (s.turn == Side::Me) ? Player::Me : Player::Opp;
-    m.phase = (s.phase == Phase::Attack) ? MatchPhase::Attack : MatchPhase::Defense;
-
-    // Стол: скопируем пары. Карта-на-руке бота из Knowledge уже учтена в m.hands[0].
-    for (const auto& p : s.table) {
-        if (m.tableLen >= 6) break;
-        Pair& tp = m.table[m.tableLen++];
-        tp.attack = p.attack;
-        if (p.defended) {
-            tp.defense = p.defense;
-            tp.defended = true;
-        }
-    }
-    return m;
-}
-
-} // namespace
-
 Bot::Bot() {
-    // По умолчанию бот — чисто математический (без нейросети).
-    // Сеть подгружается ОПЦИОНАЛЬНО: если есть checkpoints/model.onnx и она
-    // успешно инициализируется — используем её в ISMCTS. Иначе ISMCTS работает
-    // по UCB1 + rollout (передаём nullptr), что даёт корректный мат. поиск
-    // вместо деградации на RandomNet (uniform priors + value=0.5).
-#ifdef DURAKK_USE_ONNX
-    try {
-        auto onnx = std::make_unique<OnnxNet>("checkpoints/model.onnx", "CUDA", 0);
-        if (onnx->isReady()) {
-            net_ = std::move(onnx);
-            hasRealNet_ = true;
-        } else {
-            std::fprintf(stderr, "[Bot] OnnxNet не готов — работаем без сети (чистая математика).\n");
-        }
-    } catch (...) {
-        try {
-            auto onnx = std::make_unique<OnnxNet>("checkpoints/model.onnx", "CPU", 0);
-            if (onnx->isReady()) {
-                net_ = std::move(onnx);
-                hasRealNet_ = true;
-            }
-        } catch (...) {
-            std::fprintf(stderr, "[Bot] OnnxNet недоступен — работаем без сети (чистая математика).\n");
-        }
-    }
-#endif
+    ensureInit();
 }
 
 Move Bot::decide(const GameState& s, const Knowledge& k,
                  const SearchSettings& settings, DecisionStats* statsOut) {
-    DecisionStats stats{};
-    MatchState root = toMatchState(s, k);
+    ensureInit();
+    updateBayesWeights(s);
 
-    // ---------- Эндшпиль: колода пуста → minimax α-β (perfect information) ----------
-    if (s.deck.remaining == 0) {
-        // FIX (этап 0.2): раньше сюда передавался весь unknownPool (мог быть
-        // 20+ карт при реальных 3 у соперника) — минимакс играл с нереалистично
-        // большой рукой оппонента. Теперь сэмплируем ровно oppHandCount карт.
-        // Когда колода пуста, неизвестные карты в норме ВСЕ у соперника
-        // (если трекинг Knowledge корректен) — тогда need >= popCount(pool)
-        // и sampleOppHandForEndgame вернёт pool целиком без потерь.
-        CardMask pool = k.unknownPool();
-        root.hands[1] = sampleOppHandForEndgame(pool, k.oppHandCount);
-        root.deck = 0;
-        root.deckRemaining = 0;
+    uint64_t botHand = k.myHand;
+    uint64_t tableAtk = 0;
+    uint64_t tableDef = 0;
 
-        EndgameLimits lim;
-        lim.timeBudgetSec = timeoutFor(settings.strength);
-        EndgameResult er = bestEndgameMove(root, Player::Me, lim, nullptr);
-
-        stats.mode = "Endgame";
-        stats.depthReached = er.depthReached;
-        stats.solved = er.solved;
-        stats.timeMs = er.timeMs;
-        stats.playouts = er.nodes;
-        if (statsOut) *statsOut = stats;
-        if (!er.move.reason.empty()) {
-            return er.move;
+    for (const auto& pair : s.table) {
+        tableAtk |= bb::cardBit(pair.attack.rank, static_cast<int>(pair.attack.suit));
+        if (pair.defended) {
+            tableDef |= bb::cardBit(pair.defense.rank, static_cast<int>(pair.defense.suit));
         }
-        Move m = er.move;
-        m.reason = er.solved
-            ? (er.score > 0 ? "эндшпиль: форсированная победа (минимакс)"
-                            : "эндшпиль: позиция проиграна (минимакс)")
-            : "эндшпиль: лучший ход перебором (α-β)";
+    }
+
+    uint64_t deck = 0;
+    int trumpSuit = static_cast<int>(s.deck.trump);
+    int phase = (s.phase == Phase::Attack) ? 0 : 1;
+    int attacker = (s.attacker == Side::Me) ? 0 : 1;
+    int botPlayer = 0; // Мы играем за 0
+    int oppCardCount = k.oppHandCount;
+
+    int moveEncoded = g_mcts.decide(
+        botHand, 0, tableAtk, tableDef, deck,
+        trumpSuit, phase, attacker, botPlayer,
+        oppCardCount, g_bayesWeights
+    );
+
+    Move m{};
+    if (moveEncoded < 0) {
+        m.action = Action::Pass;
+        m.reason = "No legal moves";
         return m;
     }
 
-    // ---------- Фаза с колодой → ISMCTS ----------
-    // FIX (этап 0.1): передаём сеть ТОЛЬКО если она реально загружена.
-    // При отсутствии сети (по умолчанию для математического бота) — nullptr,
-    // тогда ISMCTS идёт по UCB1 + rollout (корректный мат. путь), а не по
-    // PUCT с uniform priors из RandomNet (что деградирует поиск).
-    IsmctsLimits lim;
-    lim.timeBudgetSec = timeoutFor(settings.strength);
-    lim.numThreads = settings.numThreads;
-    PolicyValueNet* net = hasRealNet_ ? net_.get() : nullptr;
-    IsmctsResult r = runIsmcts(root, k, lim, nullptr, Player::Me, net);
+    int cardIdx = moveCard(moveEncoded);
+    int actionType = moveAction(moveEncoded);
 
-    stats.mode = hasRealNet_ ? "ISMCTS+NN" : "ISMCTS";
-    stats.playouts = r.playouts;
-    stats.winrate = r.winrate;
-    stats.timeMs = r.timeMs;
-    if (statsOut) *statsOut = stats;
+    m.card = Card(bb::rankOf(cardIdx), static_cast<Suit>(bb::suitOf(cardIdx)));
 
-    Move m = r.move;
-    if (m.reason.empty()) {
-        char buf[160];
-        std::snprintf(buf, sizeof(buf),
-            "ISMCTS: %ld плейаутов, winrate≈%.0f%%, %d корневых ходов, %.2fs",
-            r.playouts, r.winrate * 100.0, r.rootChildren, r.timeMs / 1000.0);
-        m.reason = buf;
+    switch (actionType) {
+    case MOVE_ATTACK:
+        m.action = Action::Attack;
+        m.reason = "MCTS Attack";
+        break;
+    case MOVE_DEFEND:
+        m.action = Action::Defend;
+        m.reason = "MCTS Defend";
+        for (const auto& pair : s.table) {
+            if (!pair.defended) {
+                m.target = pair.attack;
+                m.hasTarget = true;
+                break;
+            }
+        }
+        break;
+    case MOVE_TAKE:
+        m.action = Action::Take;
+        m.reason = "MCTS Take";
+        break;
+    case MOVE_BITO:
+        m.action = Action::Done;
+        m.reason = "MCTS Bito";
+        break;
+    case MOVE_TRANSFER:
+        m.action = Action::Transfer;
+        m.reason = "MCTS Transfer";
+        break;
+    default:
+        m.action = Action::Pass;
+        m.reason = "MCTS Pass";
+        break;
     }
+
+    if (statsOut) {
+        SearchStats stats = g_mcts.getLastStats();
+        statsOut->mode = g_gpu.isReady() ? "MCTS+GPU" : "MCTS";
+        statsOut->playouts = stats.gpuRollouts;
+        statsOut->winrate = stats.bestWinRate;
+        statsOut->timeMs = stats.timeMs;
+    }
+
     return m;
 }
 
