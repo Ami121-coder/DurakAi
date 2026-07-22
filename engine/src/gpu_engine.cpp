@@ -4,219 +4,165 @@
 #include <cstring>
 #include <algorithm>
 
-// CUDA launcher declarations (из gpu_launchers.cu)
+// Объявления CUDA-ядер (из gpu_kernels.cu)
 extern "C" {
-    void launchRollouts(const GpuGameState* states, int* results, int N,
-                        int botPlayer, unsigned long long seed, void* stream);
-    void launchEval(const GpuGameState* states, float* scores, int N,
-                    int botPlayer, void* stream);
-    void launchSample(uint64_t* sampled, uint64_t known, const float* weights,
-                      int handSize, int N, unsigned long long seed, void* stream);
-    void launchReduce(const int* results, int* wins, int* losses, int* draws,
-                      int N, void* stream);
+    void launchRollouts(const GpuGameState* states, int* results, int N, int botPlayer, unsigned long long seed);
+    void launchEval(const GpuGameState* states, float* scores, int N, int botPlayer);
+    void launchSample(uint64_t* sampled, uint64_t known, const float* weights, int handSize, int N, unsigned long long seed);
+    void launchReduce(const int* results, int* wins, int* losses, int* draws, int N);
     void uploadEvalParams(const EvalParams& params);
 }
 
-static constexpr size_t STATE_SIZE = 64;
-static constexpr size_t DEFAULT_CAPACITY = 524288; // 512K состояний = 32 MB
+// Размер состояния (должен совпадать с CUDA struct)
+static constexpr size_t GPU_STATE_SIZE = 64;
 
 GpuEngine::GpuEngine() {}
+
 GpuEngine::~GpuEngine() { shutdown(); }
 
 bool GpuEngine::init(int deviceIndex) {
-    cudaError_t err = cudaSetDevice(deviceIndex);
+    cudaError_t err;
+
+    err = cudaSetDevice(deviceIndex);
     if (err != cudaSuccess) {
-        fprintf(stderr, "[GPU] cudaSetDevice: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "[GPU] cudaSetDevice failed: %s\n", cudaGetErrorString(err));
         return false;
     }
 
+    // Проверяем устройство
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, deviceIndex);
-    printf("[GPU] %s | SM %d.%d | %d SMs | %.1f GB VRAM\n",
+    printf("[GPU] Device: %s, SM %d.%d, %d SMs, %.1f GB VRAM\n",
            prop.name, prop.major, prop.minor,
-           prop.multiProcessorCount, prop.totalGlobalMem / 1e9);
+           prop.multiProcessorCount,
+           prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
 
-    capacity_ = DEFAULT_CAPACITY;
+    // RTX 4060 Ti: SM 8.9, 34 SM, 8 GB
+    // Выделяем буферы под 1M состояний (64 MB) — комфортно для 8 GB
+    allocStates_ = 1024 * 1024; // 1M
+    allocResults_ = allocStates_;
 
-    // Преаллокация ВСЕХ буферов (ФИКС #5: никаких malloc в hot path)
-    for (int b = 0; b < 2; ++b) {
-        cudaMalloc(&d_states_[b], capacity_ * STATE_SIZE);
-        cudaMalloc(&d_results_[b], capacity_ * sizeof(int));
-    }
-    cudaMalloc(&d_scores_, capacity_ * sizeof(float));
-    cudaMalloc(&d_sampled_, capacity_ * sizeof(uint64_t));
-    cudaMalloc(&d_weights_, 36 * sizeof(float));
-    cudaMalloc(&d_wins_, sizeof(int));
-    cudaMalloc(&d_losses_, sizeof(int));
-    cudaMalloc(&d_draws_, sizeof(int));
+    err = cudaMalloc(&d_states_, allocStates_ * GPU_STATE_SIZE);
+    if (err != cudaSuccess) { fprintf(stderr, "[GPU] alloc states failed\n"); return false; }
 
-    // CUDA streams для async overlap (ФИКС #6)
-    for (int s = 0; s < 2; ++s) {
-        cudaStreamCreate((cudaStream_t*)&streams_[s]);
-    }
+    err = cudaMalloc(&d_results_, allocResults_ * sizeof(int));
+    if (err != cudaSuccess) { fprintf(stderr, "[GPU] alloc results failed\n"); return false; }
+
+    err = cudaMalloc(&d_scores_, allocStates_ * sizeof(float));
+    if (err != cudaSuccess) { fprintf(stderr, "[GPU] alloc scores failed\n"); return false; }
+
+    err = cudaMalloc(&d_sampled_, allocStates_ * sizeof(uint64_t));
+    if (err != cudaSuccess) { fprintf(stderr, "[GPU] alloc sampled failed\n"); return false; }
+
+    err = cudaMalloc(&d_weights_, 36 * sizeof(float));
+    if (err != cudaSuccess) { fprintf(stderr, "[GPU] alloc weights failed\n"); return false; }
+
+    err = cudaMalloc(&d_params_, sizeof(EvalParams));
+    if (err != cudaSuccess) { fprintf(stderr, "[GPU] alloc params failed\n"); return false; }
 
     ready_ = true;
-    printf("[GPU] Buffers: %zuK states (%.1f MB), 2 streams, preallocated\n",
-           capacity_ / 1024, capacity_ * STATE_SIZE / 1e6);
+    printf("[GPU] Initialized. Buffer capacity: %zu states (%.1f MB)\n",
+           allocStates_, allocStates_ * GPU_STATE_SIZE / (1024.0 * 1024.0));
     return true;
 }
 
 void GpuEngine::shutdown() {
-    for (int b = 0; b < 2; ++b) {
-        if (d_states_[b]) cudaFree(d_states_[b]);
-        if (d_results_[b]) cudaFree(d_results_[b]);
-        if (streams_[b]) cudaStreamDestroy((cudaStream_t)streams_[b]);
-    }
+    if (d_states_) cudaFree(d_states_);
+    if (d_results_) cudaFree(d_results_);
     if (d_scores_) cudaFree(d_scores_);
     if (d_sampled_) cudaFree(d_sampled_);
     if (d_weights_) cudaFree(d_weights_);
-    if (d_wins_) cudaFree(d_wins_);
-    if (d_losses_) cudaFree(d_losses_);
-    if (d_draws_) cudaFree(d_draws_);
-    memset(this, 0, sizeof(*this)); // обнуляем указатели
-}
-
-void GpuEngine::ensureCapacity(size_t n) {
-    if (n <= capacity_) return;
-    // Реаллокация (редко, только если батч > 512K)
-    size_t newCap = n;
-    for (int b = 0; b < 2; ++b) {
-        cudaFree(d_states_[b]);
-        cudaFree(d_results_[b]);
-        cudaMalloc(&d_states_[b], newCap * STATE_SIZE);
-        cudaMalloc(&d_results_[b], newCap * sizeof(int));
-    }
-    cudaFree(d_scores_);
-    cudaMalloc(&d_scores_, newCap * sizeof(float));
-    cudaFree(d_sampled_);
-    cudaMalloc(&d_sampled_, newCap * sizeof(uint64_t));
-    capacity_ = newCap;
-    printf("[GPU] Reallocated to %zuK states\n", newCap / 1024);
+    if (d_params_) cudaFree(d_params_);
+    d_states_ = d_results_ = d_scores_ = d_sampled_ = d_weights_ = d_params_ = nullptr;
+    ready_ = false;
 }
 
 GpuRolloutResult GpuEngine::runRollouts(
-    const std::vector<GpuGameState>& states, int botPlayer
+    const std::vector<GpuGameState>& states,
+    int botPlayer
 ) {
-    GpuRolloutResult res;
+    GpuRolloutResult res{0, 0, 0, 0.0f};
     if (!ready_ || states.empty()) return res;
 
     int N = (int)states.size();
-    ensureCapacity(N);
-    int buf = 0;
+    if ((size_t)N > allocStates_) N = (int)allocStates_;
 
-    // Upload
-    cudaMemcpyAsync(d_states_[buf], states.data(), N * STATE_SIZE,
-                    cudaMemcpyHostToDevice, (cudaStream_t)streams_[buf]);
+    // Upload states
+    cudaMemcpy(d_states_, states.data(), N * GPU_STATE_SIZE, cudaMemcpyHostToDevice);
 
-    // Reset counters
-    cudaMemsetAsync(d_wins_, 0, sizeof(int), (cudaStream_t)streams_[buf]);
-    cudaMemsetAsync(d_losses_, 0, sizeof(int), (cudaStream_t)streams_[buf]);
-    cudaMemsetAsync(d_draws_, 0, sizeof(int), (cudaStream_t)streams_[buf]);
+    // Launch rollouts: 256 threads/block, оптимально для 4060 Ti (34 SM)
+    int threadsPerBlock = 256;
+    int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
+    // Ограничиваем для occupancy на 4060 Ti
+    blocks = std::min(blocks, 34 * 16); // 34 SM * 16 blocks/SM
 
-    // Launch rollouts
-    launchRollouts((const GpuGameState*)d_states_[buf],
-                   (int*)d_results_[buf], N, botPlayer, rngSeed_,
-                   streams_[buf]);
-    rngSeed_ += 7919;
+    launchRollouts((const GpuGameState*)d_states_, (int*)d_results_, N, botPlayer, rngSeed_);
+    rngSeed_ += 7919; // простое число
 
     // Reduce
-    launchReduce((const int*)d_results_[buf],
-                 (int*)d_wins_, (int*)d_losses_, (int*)d_draws_,
-                 N, streams_[buf]);
+    int *d_w, *d_l, *d_dr;
+    cudaMalloc(&d_w, sizeof(int)); cudaMemset(d_w, 0, sizeof(int));
+    cudaMalloc(&d_l, sizeof(int)); cudaMemset(d_l, 0, sizeof(int));
+    cudaMalloc(&d_dr, sizeof(int)); cudaMemset(d_dr, 0, sizeof(int));
 
-    // Sync + download
-    cudaStreamSynchronize((cudaStream_t)streams_[buf]);
-    cudaMemcpy(&res.wins, d_wins_, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&res.losses, d_losses_, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&res.draws, d_draws_, sizeof(int), cudaMemcpyDeviceToHost);
+    launchReduce((const int*)d_results_, d_w, d_l, d_dr, N);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(&res.wins, d_w, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&res.losses, d_l, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&res.draws, d_dr, sizeof(int), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_w); cudaFree(d_l); cudaFree(d_dr);
 
     int total = res.wins + res.losses + res.draws;
     res.winRate = (total > 0) ? (float)(res.wins + 0.5f * res.draws) / total : 0.5f;
     return res;
 }
 
-void GpuEngine::runRolloutsAsync(
-    const std::vector<GpuGameState>& states, int botPlayer,
-    std::function<void(GpuRolloutResult)> callback
-) {
-    if (!ready_ || states.empty()) { callback({}); return; }
-
-    int N = (int)states.size();
-    ensureCapacity(N);
-    int buf = curBuf_;
-    curBuf_ = 1 - curBuf_; // flip
-
-    cudaMemcpyAsync(d_states_[buf], states.data(), N * STATE_SIZE,
-                    cudaMemcpyHostToDevice, (cudaStream_t)streams_[buf]);
-    cudaMemsetAsync(d_wins_, 0, sizeof(int), (cudaStream_t)streams_[buf]);
-    cudaMemsetAsync(d_losses_, 0, sizeof(int), (cudaStream_t)streams_[buf]);
-    cudaMemsetAsync(d_draws_, 0, sizeof(int), (cudaStream_t)streams_[buf]);
-
-    launchRollouts((const GpuGameState*)d_states_[buf],
-                   (int*)d_results_[buf], N, botPlayer, rngSeed_,
-                   streams_[buf]);
-    rngSeed_ += 7919;
-
-    launchReduce((const int*)d_results_[buf],
-                 (int*)d_wins_, (int*)d_losses_, (int*)d_draws_,
-                 N, streams_[buf]);
-
-    asyncPending_ = true;
-    // Callback вызывается в pollAsync()
-}
-
-bool GpuEngine::pollAsync(GpuRolloutResult& out) {
-    if (!asyncPending_) return false;
-    int buf = 1 - curBuf_; // предыдущий буфер
-    cudaError_t status = cudaStreamQuery((cudaStream_t)streams_[buf]);
-    if (status == cudaSuccess) {
-        cudaMemcpy(&out.wins, d_wins_, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&out.losses, d_losses_, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&out.draws, d_draws_, sizeof(int), cudaMemcpyDeviceToHost);
-        int total = out.wins + out.losses + out.draws;
-        out.winRate = (total > 0) ? (float)(out.wins + 0.5f * out.draws) / total : 0.5f;
-        asyncPending_ = false;
-        return true;
-    }
-    return false; // ещё не готово
-}
-
 std::vector<float> GpuEngine::evaluateBatch(
-    const std::vector<GpuGameState>& states, int botPlayer
+    const std::vector<GpuGameState>& states,
+    int botPlayer
 ) {
     std::vector<float> scores(states.size(), 0.0f);
     if (!ready_ || states.empty()) return scores;
 
     int N = (int)states.size();
-    ensureCapacity(N);
-    cudaMemcpyAsync(d_states_[0], states.data(), N * STATE_SIZE,
-                    cudaMemcpyHostToDevice, (cudaStream_t)streams_[0]);
-    launchEval((const GpuGameState*)d_states_[0], (float*)d_scores_,
-               N, botPlayer, streams_[0]);
-    cudaStreamSynchronize((cudaStream_t)streams_[0]);
+    cudaMemcpy(d_states_, states.data(), N * GPU_STATE_SIZE, cudaMemcpyHostToDevice);
+
+    int tpb = 256;
+    int blocks = (N + tpb - 1) / tpb;
+    launchEval((const GpuGameState*)d_states_, (float*)d_scores_, N, botPlayer);
+    cudaDeviceSynchronize();
+
     cudaMemcpy(scores.data(), d_scores_, N * sizeof(float), cudaMemcpyDeviceToHost);
     return scores;
 }
 
 std::vector<uint64_t> GpuEngine::sampleOpponentHands(
-    uint64_t knownCards, const float weights[36], int handSize, int count
+    uint64_t knownCards,
+    const float weights[36],
+    int handSize,
+    int count
 ) {
     std::vector<uint64_t> hands(count, 0);
     if (!ready_ || count <= 0) return hands;
 
-    int N = std::min(count, (int)capacity_);
-    cudaMemcpyAsync(d_weights_, weights, 36 * sizeof(float),
-                    cudaMemcpyHostToDevice, (cudaStream_t)streams_[0]);
-    launchSample((uint64_t*)d_sampled_, knownCards, (const float*)d_weights_,
-                 handSize, N, rngSeed_, streams_[0]);
+    int N = std::min(count, (int)allocStates_);
+    cudaMemcpy(d_weights_, weights, 36 * sizeof(float), cudaMemcpyHostToDevice);
+
+    int tpb = 256;
+    int blocks = (N + tpb - 1) / tpb;
+    launchSample((uint64_t*)d_sampled_, knownCards, (const float*)d_weights_, handSize, N, rngSeed_);
     rngSeed_ += 104729;
-    cudaStreamSynchronize((cudaStream_t)streams_[0]);
+    cudaDeviceSynchronize();
+
     cudaMemcpy(hands.data(), d_sampled_, N * sizeof(uint64_t), cudaMemcpyDeviceToHost);
     return hands;
 }
 
 void GpuEngine::setEvalParams(const EvalParams& params) {
-    if (ready_) uploadEvalParams(params);
+    if (!ready_) return;
+    uploadEvalParams(params);
 }
 
 GpuEngine::DeviceInfo GpuEngine::getDeviceInfo() const {
@@ -224,7 +170,10 @@ GpuEngine::DeviceInfo GpuEngine::getDeviceInfo() const {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
     strncpy(info.name, prop.name, 255);
-    info.smCount = prop.multiProcessorCount;
+    info.computeMajor = prop.major;
+    info.computeMinor = prop.minor;
     info.totalMem = prop.totalGlobalMem;
+    info.smCount = prop.multiProcessorCount;
+    info.maxThreadsPerSM = prop.maxThreadsPerMultiProcessor;
     return info;
 }

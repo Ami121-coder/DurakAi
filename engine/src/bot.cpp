@@ -67,7 +67,7 @@ static void ensureInit() {
 // ============================================================
 // Обновление байесовских весов по истории ходов
 // ============================================================
-static void updateBayesWeights(const durakk::GameState& state) {
+static void updateBayesWeights(const GameState& state) {
     // Карты, которые точно НЕ у соперника:
     // - наши карты
     // - карты на столе
@@ -76,14 +76,14 @@ static void updateBayesWeights(const durakk::GameState& state) {
 
     // Наши карты
     for (auto& c : state.hands[0]) { // bot = player 0
-        knownNotOpp |= bb::cardBit(c.rank, static_cast<int>(c.suit));
+        knownNotOpp |= bb::cardBit(c.rank, c.suit);
     }
 
     // Стол
     for (auto& p : state.table) {
-        knownNotOpp |= bb::cardBit(p.attack.rank, static_cast<int>(p.attack.suit));
-        if (p.defended)
-            knownNotOpp |= bb::cardBit(p.defense.rank, static_cast<int>(p.defense.suit));
+        knownNotOpp |= bb::cardBit(p.attack.rank, p.attack.suit);
+        if (p.defense.rank >= 0)
+            knownNotOpp |= bb::cardBit(p.defense.rank, p.defense.suit);
     }
 
     // Обновляем веса: известные карты → вес 0
@@ -98,108 +98,127 @@ static void updateBayesWeights(const durakk::GameState& state) {
 
     // Эвристика: если соперник не побил карту ранга R — вероятно нет карт ранга R+
     for (auto& p : state.table) {
-        if (!p.defended) { // не побита
+        if (p.defense.rank < 0) { // не побита
             int atkRank = p.attack.rank;
-            for (int r = atkRank; r <= 14; ++r) {
-                for (int s = 0; s < 4; ++s) {
-                    int idx = bb::cardIndex(r, s);
-                    g_bayesWeights[idx] *= 0.5f;
-                }
+            // Карты того же ранга менее вероятны (уже на столе)
+            // Карты ранга atkRank+1 той же масти менее вероятны (мог бы побить)
+            int nextRank = atkRank + 1;
+            if (nextRank <= 14) {
+                int idx = bb::cardIndex(nextRank, p.attack.suit);
+                g_bayesWeights[idx] *= 0.3f; // штраф
             }
+            // Козырь той же масти менее вероятен
+            int trumpIdx = bb::cardIndex(atkRank, state.trumpSuit);
+            if (!(knownNotOpp & (1ULL << trumpIdx)))
+                g_bayesWeights[trumpIdx] *= 0.5f;
         }
     }
 }
 
-namespace durakk {
-
-Bot::Bot() {
-    ensureInit();
+// ============================================================
+// Конвертация GameState → bitboard
+// ============================================================
+static uint64_t handToBitboard(const std::vector<Card>& hand) {
+    uint64_t mask = 0;
+    for (auto& c : hand) mask |= bb::cardBit(c.rank, c.suit);
+    return mask;
 }
 
-Move Bot::decide(const GameState& s, const Knowledge& k,
-                 const SearchSettings& settings, DecisionStats* statsOut) {
-    ensureInit();
-    updateBayesWeights(s);
+static uint64_t tableAtkToBitboard(const GameState& state) {
+    uint64_t mask = 0;
+    for (auto& p : state.table) mask |= bb::cardBit(p.attack.rank, p.attack.suit);
+    return mask;
+}
 
-    uint64_t botHand = k.myHand;
-    uint64_t tableAtk = 0;
-    uint64_t tableDef = 0;
+static uint64_t tableDefToBitboard(const GameState& state) {
+    uint64_t mask = 0;
+    for (auto& p : state.table)
+        if (p.defense.rank >= 0) mask |= bb::cardBit(p.defense.rank, p.defense.suit);
+    return mask;
+}
 
-    for (const auto& pair : s.table) {
-        tableAtk |= bb::cardBit(pair.attack.rank, static_cast<int>(pair.attack.suit));
-        if (pair.defended) {
-            tableDef |= bb::cardBit(pair.defense.rank, static_cast<int>(pair.defense.suit));
-        }
+static uint64_t deckToBitboard(const GameState& state) {
+    // Все карты минус известные
+    uint64_t all = (1ULL << 36) - 1;
+    uint64_t known = handToBitboard(state.hands[0]);
+    known |= tableAtkToBitboard(state);
+    known |= tableDefToBitboard(state);
+    // Карты соперника неизвестны, но их количество знаем
+    // Колода = все - наши - стол - соперник (но соперника не знаем)
+    // Аппроксимация: колода = все - наши - стол (с учётом deckCount)
+    uint64_t deck = all & ~known;
+    // Ограничиваем по deckCount
+    int dc = state.deckCount;
+    uint64_t result = 0;
+    uint64_t tmp = deck;
+    for (int i = 0; i < dc && tmp; ++i) {
+        int bit = bb::popLowest(tmp);
+        result |= (1ULL << bit);
     }
+    return result;
+}
 
-    uint64_t deck = 0;
-    int trumpSuit = static_cast<int>(s.deck.trump);
-    int phase = (s.phase == Phase::Attack) ? 0 : 1;
-    int attacker = (s.attacker == Side::Me) ? 0 : 1;
-    int botPlayer = 0; // Мы играем за 0
-    int oppCardCount = k.oppHandCount;
+// ============================================================
+// Главная функция: Bot::decide()
+// ============================================================
+Move Bot::decide(const GameState& state) {
+    ensureInit();
 
-    int moveEncoded = g_mcts.decide(
-        botHand, 0, tableAtk, tableDef, deck,
-        trumpSuit, phase, attacker, botPlayer,
+    int botPlayer = 0; // бот всегда player 0
+    int oppPlayer = 1;
+
+    // Обновляем байесовские веса
+    updateBayesWeights(state);
+
+    // Конвертируем в bitboard
+    uint64_t botHand = handToBitboard(state.hands[botPlayer]);
+    uint64_t tableAtk = tableAtkToBitboard(state);
+    uint64_t tableDef = tableDefToBitboard(state);
+    uint64_t deck = deckToBitboard(state);
+    int trump = state.trumpSuit;
+    int phase = (state.phase == Phase::ATTACK) ? 0 : 1;
+    int attacker = state.attacker;
+    int oppCardCount = (int)state.hands[oppPlayer].size();
+    if (oppCardCount == 0) oppCardCount = state.oppCardCount; // из UI
+
+    // Запускаем MCTS
+    int encodedMove = g_mcts.decide(
+        botHand, 0 /*oppHand unknown*/,
+        tableAtk, tableDef, deck,
+        trump, phase, attacker, botPlayer,
         oppCardCount, g_bayesWeights
     );
 
-    Move m{};
-    if (moveEncoded < 0) {
-        m.action = Action::Pass;
-        m.reason = "No legal moves";
-        return m;
+    // Логируем статистику
+    auto stats = g_mcts.getLastStats();
+    printf("[Bot] Search: %d iter, %d GPU rollouts, %d nodes, %.1f%% WR, %d ms\n",
+           stats.totalIterations, stats.gpuRollouts, stats.treeNodes,
+           stats.bestWinRate * 100.0f, stats.timeMs);
+
+    // Декодируем ход в Move
+    Move result;
+    if (encodedMove < 0) {
+        // Fallback: первая легальная карта
+        result.type = MoveType::ATTACK;
+        if (!state.hands[botPlayer].empty())
+            result.card = state.hands[botPlayer][0];
+        return result;
     }
 
-    int cardIdx = moveCard(moveEncoded);
-    int actionType = moveAction(moveEncoded);
+    int cardIdx = moveCard(encodedMove);
+    int action = moveAction(encodedMove);
 
-    m.card = Card(bb::rankOf(cardIdx), static_cast<Suit>(bb::suitOf(cardIdx)));
+    result.card.rank = bb::rankOf(cardIdx);
+    result.card.suit = bb::suitOf(cardIdx);
 
-    switch (actionType) {
-    case MOVE_ATTACK:
-        m.action = Action::Attack;
-        m.reason = "MCTS Attack";
-        break;
-    case MOVE_DEFEND:
-        m.action = Action::Defend;
-        m.reason = "MCTS Defend";
-        for (const auto& pair : s.table) {
-            if (!pair.defended) {
-                m.target = pair.attack;
-                m.hasTarget = true;
-                break;
-            }
-        }
-        break;
-    case MOVE_TAKE:
-        m.action = Action::Take;
-        m.reason = "MCTS Take";
-        break;
-    case MOVE_BITO:
-        m.action = Action::Done;
-        m.reason = "MCTS Bito";
-        break;
-    case MOVE_TRANSFER:
-        m.action = Action::Transfer;
-        m.reason = "MCTS Transfer";
-        break;
-    default:
-        m.action = Action::Pass;
-        m.reason = "MCTS Pass";
-        break;
+    switch (action) {
+    case MOVE_ATTACK:   result.type = MoveType::ATTACK; break;
+    case MOVE_DEFEND:   result.type = MoveType::DEFEND; break;
+    case MOVE_TAKE:     result.type = MoveType::TAKE; break;
+    case MOVE_BITO:     result.type = MoveType::BITO; break;
+    case MOVE_TRANSFER: result.type = MoveType::TRANSFER; break;
+    default:            result.type = MoveType::ATTACK; break;
     }
 
-    if (statsOut) {
-        SearchStats stats = g_mcts.getLastStats();
-        statsOut->mode = g_gpu.isReady() ? "MCTS+GPU" : "MCTS";
-        statsOut->playouts = stats.gpuRollouts;
-        statsOut->winrate = stats.bestWinRate;
-        statsOut->timeMs = stats.timeMs;
-    }
-
-    return m;
+    return result;
 }
-
-} // namespace durakk

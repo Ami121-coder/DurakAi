@@ -5,8 +5,8 @@
   "main": "electron/main.js",
   "scripts": {
     "start": "electron .",
-    "build:engine": "node scripts/build-engine.js",
-    "build:engine:clean": "node scripts/build-engine.js --clean"
+    "build:engine": "node scripts/build-engine.js --cuda",
+    "build:engine:clean": "node scripts/build-engine.js --cuda --clean"
   },
   "author": "",
   "license": "MIT",
