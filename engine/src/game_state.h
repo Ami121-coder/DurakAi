@@ -1,73 +1,38 @@
 #pragma once
-
 #include "card.h"
-#include "deck.h"
-#include "move.h"
-
 #include <vector>
-#include <cstdint>
+#include <string>
 
-namespace durakk {
+enum class Phase { ATTACK, DEFEND };
 
-// Чей ход / на чьей стороне бот в текущем сигнале состояния.
-enum class Side : uint8_t {
-    Me   = 0,  // бот-советник
-    Opp  = 1,  // соперник
+struct TablePair {
+    Card attack;
+    Card defense;  // rank = -1 если не побита
 };
 
-// Фаза кона (отбоя). Определяет набор допустимых действий.
-enum class Phase : uint8_t {
-    Attack,   // атакующий кладёт карту / подкидывает
-    Defense,  // защищающийся бьёт / переводит / берёт
-    Done,     // кон завершён (бито или взял) — ждём добора и нового хода
-};
-
-// Полное состояние игры на момент запроса к движку.
-//
-// Замечание: движок — советник, а не полный игровой сервер. Входное состояние
-// формируется UI вручную: мы знаем свою руку точно, руку соперника — только
-// количеством, стол и козырь — видим полностью.
 struct GameState {
-    // --- Настройки стола ---
-    DeckSize deckSize = DeckSize::Cards36;
-    bool transferEnabled = true;   // переводной режим (по ТЗ включён)
-    bool flashEnabled = false;     // «проездной» (опция стола, по умолчанию выкл.)
-    int firstTrickLimit = 5;       // лимит пар в первом коне партии
+    // Руки
+    std::vector<Card> hands[2];  // [0] = бот, [1] = соперник
+    int oppCardCount = 0;        // если рука соперника неизвестна
 
-    // --- Поле игры ---
-    Deck deck;
-    std::vector<Card> myHand;          // рука бота (точно)
-    int oppHandCount = 0;              // сколько карт у соперника (точно не знаем какие)
-    std::vector<TablePair> table;      // текущие пары на столе в порядке добавления
+    // Стол
+    std::vector<TablePair> table;
 
-    // --- Кто что делает ---
-    Side attacker = Side::Me;          // кто атакует в этом коне
-    Side turn = Side::Me;              // чей сейчас ход
-    Phase phase = Phase::Attack;       // текущая фаза
+    // Колода
+    int deckCount = 0;
+    int trumpSuit = 0;  // 0=clubs, 1=diamonds, 2=hearts, 3=spades
 
-    // --- Состояния правил ---
-    bool firstTrick = true;            // идёт ли первый кон партии (влияет на лимит)
-    bool flashUsedThisTrick = false;   // использован ли «проездной» в этом коне
+    // Фаза
+    Phase phase = Phase::ATTACK;
+    int attacker = 0;   // 0 или 1
 
-    // --- Утилиты ---
-    // Сколько карт атакующего ранга на столе (атаки + защиты).
-    int countRankOnTable(Rank r) const;
+    // Параметры правил
+    int pairsLimit = 6;     // 6 обычно, 5 для первого кона
+    bool firstTrick = false; // первый кон партии
+    bool transferEnabled = true;
+    bool flashEnabled = false;
+    bool flashUsedThisTrick = false;
 
-    // Сколько пар на столе (атака+защита).
-    int pairsCount() const { return static_cast<int>(table.size()); }
-
-    // Сколько атакующих карт на столе (равно pairsCount, т.к. пара = атака + мб защита).
-    int attackCardsCount() const { return pairsCount(); }
-
-    // Количество непобитых атакующих карт (для защиты/перевода).
-    int undefendedAttacksCount() const;
-
-    // Ранг верхней непобитой атаки — то, чем переводят.
-    // Возвращает hasValue=false, если все побиты или стол пуст.
-    bool topUndefendedAttackRank(Rank& out) const;
-
-    // Рука «активной стороны»: своей мы знаем, чужой — нет (но можем спросить размер).
-    Side opposite(Side s) const { return s == Side::Me ? Side::Opp : Side::Me; }
+    // Сброс (бито) — для Bayesian
+    std::vector<Card> discard;
 };
-
-} // namespace durakk

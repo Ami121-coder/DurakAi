@@ -91,24 +91,25 @@ if (isWin) {
     const vcpkgToolchain = path.join('C:\\', 'vcpkg', 'scripts', 'buildsystems', 'vcpkg.cmake');
     const vcpkgArg = fs.existsSync(vcpkgToolchain) ? `-DCMAKE_TOOLCHAIN_FILE="${vcpkgToolchain}"` : '';
 
-    // Было: cmake -G "Visual Studio 17 2022" -A x64 ..
-    // Стало:
+    if (!fs.existsSync(BUILD)) fs.mkdirSync(BUILD, { recursive: true });
+
     const cmakeArgs = [
         '-G', 'Visual Studio 17 2022',
         '-A', 'x64',
         '-DCMAKE_BUILD_TYPE=Release',
-        '-DCMAKE_CUDA_ARCHITECTURES=89',   // RTX 4060 Ti
-        '-T', 'cuda=C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6',
+        '-DCMAKE_CUDA_ARCHITECTURES=89',
         '..'
     ];
+    const cmakeConfigureCmd = cmakeArgs.map(a => a.includes(' ') ? `"${a}"` : a).join(' ');
 
     const cmd = [
         envSetupCmd,
-        `&& "${cmake}" -S "${ENGINE}" -B "${BUILD}" ${cmakeArgs.filter(a => a !== '..').map(a => `"${a}"`).join(' ')} ${vcpkgArg}`,
+        `&& cd /d "${BUILD}" && "${cmake}" ${cmakeConfigureCmd} ${vcpkgArg}`,
         `&& "${cmake}" --build "${BUILD}" --config Release --parallel`,
     ].join(' ');
 
     log('Запуск сборки (Windows)...');
+
     try {
         execSync(cmd, { stdio: 'inherit' });
     } catch (e) {

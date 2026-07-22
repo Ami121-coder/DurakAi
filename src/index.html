@@ -1,121 +1,83 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-    <meta charset="UTF-8" />
-    <meta http-equiv="Content-Security-Policy"
-          content="default-src 'self'; style-src 'self' 'unsafe-inline';" />
-    <title>Помощник: переводной дурак онлайн</title>
-    <link rel="stylesheet" href="styles.css" />
+    <meta charset="UTF-8">
+    <title>Дурак AI — Советник</title>
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <header class="topbar">
-        <h1>🃏 Дурак-онлайн · помощник</h1>
-        <div id="engineStatus" class="badge badge--unknown">движок: проверка…</div>
+    <header>
+        <h1>🃏 Дурак AI</h1>
+        <span id="engine-status">движок: загрузка...</span>
     </header>
 
-    <main class="layout">
-        <!-- ===================== ВВОД СОСТОЯНИЯ ===================== -->
-        <section class="panel panel--input">
-            <h2>Состояние игры</h2>
+    <main>
+        <!-- Моя рука -->
+        <section>
+            <h2>Моя рука</h2>
+            <div id="my-hand" class="card-grid"></div>
+        </section>
 
-            <div class="field-row">
+        <!-- Параметры -->
+        <section class="params">
+            <div>
                 <label>Козырь:</label>
-                <div id="trumpPicker" class="suit-picker"></div>
-                <label class="check">
-                    <input type="checkbox" id="transferEnabled" checked /> Переводной
-                </label>
-                <label class="check">
-                    <input type="checkbox" id="flashEnabled" /> Проездной
-                </label>
+                <button class="trump-btn" data-suit="clubs">♣</button>
+                <button class="trump-btn" data-suit="diamonds">♦</button>
+                <button class="trump-btn" data-suit="hearts">♥</button>
+                <button class="trump-btn" data-suit="spades">♠</button>
             </div>
-
-            <div class="field-row">
-                <label>Колода (ост.):
-                    <input type="number" id="deckCount" min="0" max="36" value="0" />
-                </label>
-                <label>Карт у соперника:
-                    <input type="number" id="oppHandCount" min="0" max="36" value="0" />
-                </label>
-                <label>Фаза:
-                    <select id="phase">
-                        <option value="attack">атака</option>
-                        <option value="defense">защита</option>
-                    </select>
-                </label>
-                <label>Чей ход:
-                    <select id="turn">
-                        <option value="me">я</option>
-                        <option value="opp">соперник</option>
-                    </select>
-                </label>
-                <label>Атакующий:
-                    <select id="attacker">
-                        <option value="me">я</option>
-                        <option value="opp">соперник</option>
-                    </select>
-                </label>
-                <label class="check">
-                    <input type="checkbox" id="firstTrick" checked /> Первый кон
-                </label>
+            <div>
+                <label>Колода (ост.):</label>
+                <input type="number" id="deck-count" value="24" min="0" max="36">
             </div>
-
-            <h3>Моя рука</h3>
-            <div id="handGrid" class="card-grid"></div>
-
-            <h3>Стол</h3>
-            <div id="tableGrid" class="card-grid card-grid--table"></div>
-            <div class="field-row">
-                <button id="addTablePair" type="button">＋ пара на стол</button>
-                <button id="clearTable" type="button">очистить стол</button>
+            <div>
+                <label>Карт у соперника:</label>
+                <input type="number" id="opp-count" value="6" min="0" max="36">
             </div>
-
-            <div class="actions">
-                <button id="btnDecide" class="btn btn--primary">💡 Получить совет</button>
-                <button id="btnLegal" class="btn">📜 Легальные ходы</button>
-                <button id="btnReset" class="btn btn--ghost">↺ Сброс</button>
+            <div>
+                <label>Фаза:</label>
+                <select id="phase-select">
+                    <option value="attack">Атака</option>
+                    <option value="defend">Защита</option>
+                </select>
             </div>
-
-            <h3>Память бота (абсолютная)</h3>
-            <p class="hint">Карты, ушедшие в отбой, и карты, которые соперник забрал со стола.</p>
-            <div class="mem-row">
-                <div>
-                    <label>Карты в бите:</label>
-                    <div id="discardGrid" class="card-grid card-grid--small"></div>
-                </div>
-                <div>
-                    <label>Соперник забрал:</label>
-                    <div id="oppTakenGrid" class="card-grid card-grid--small"></div>
-                </div>
+            <div>
+                <label>Атакующий:</label>
+                <select id="attacker-select">
+                    <option value="0">Я (бот)</option>
+                    <option value="1">Соперник</option>
+                </select>
             </div>
-
-            <h3>Сила ИИ</h3>
-            <div class="strength-row">
-                <button class="btn strength-btn" data-strength="fast">⚡ Быстро</button>
-                <button class="btn strength-btn strength-btn--active" data-strength="normal">🧠 Норма</button>
-                <button class="btn strength-btn" data-strength="deep">🔬 Глубоко</button>
+            <div>
+                <label>
+                    <input type="checkbox" id="first-trick"> Первый кон (лимит 5)
+                </label>
             </div>
         </section>
 
-        <!-- ===================== ВЫВОД БОТА ===================== -->
-        <section class="panel panel--output">
-            <h2>Совет бота</h2>
-            <div id="advice" class="advice advice--empty">
-                Заполните состояние и нажмите «Получить совет».
+        <!-- Стол -->
+        <section>
+            <h2>Стол</h2>
+            <div id="table-pairs"></div>
+            <div class="add-pair-row">
+                <input id="atk-input" placeholder="атака: 7 clubs" size="12">
+                <input id="def-input" placeholder="защита: K clubs" size="12">
+                <button id="add-pair">＋ пара</button>
             </div>
+        </section>
 
-            <h3>Легальные ходы</h3>
-            <div id="legalList" class="legal-list">—</div>
+        <!-- Кнопки -->
+        <section class="actions">
+            <button id="btn-advice" class="btn-primary">🧠 Получить совет</button>
+            <button id="btn-legal" class="btn-secondary">📋 Легальные ходы</button>
+        </section>
 
-            <!-- FIX #22: два <summary> в одном <details> — невалидный HTML.
-                 Разделили на два отдельных <details>. -->
-            <details class="json-details">
-                <summary>Последний запрос (JSON)</summary>
-                <pre id="lastRequest"></pre>
-            </details>
-            <details class="json-details">
-                <summary>Последний ответ (JSON)</summary>
-                <pre id="lastResponse"></pre>
-            </details>
+        <!-- Результат -->
+        <section>
+            <div id="status"></div>
+            <div id="result"></div>
+            <div id="legal-moves" class="legal-list"></div>
         </section>
     </main>
 

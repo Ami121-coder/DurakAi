@@ -275,3 +275,71 @@ button:hover { background: var(--bg-card-hover); }
     margin-top: 8px; display: flex; gap: 14px; flex-wrap: wrap;
 }
 .stats b { color: var(--rank); }
+
+.advice {
+    background: #1a472a;
+    border: 2px solid #4caf50;
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 10px 0;
+    font-size: 1.2em;
+    color: #a5d6a7;
+}
+
+.advice-highlight {
+    background: #4caf50 !important;
+    color: #000 !important;
+    box-shadow: 0 0 12px #4caf50;
+    transform: scale(1.1);
+}
+
+.card-btn {
+    width: 48px; height: 64px;
+    margin: 2px;
+    border: 1px solid #555;
+    border-radius: 6px;
+    background: #2a2a2a;
+    color: #eee;
+    cursor: pointer;
+    font-size: 14px;
+}
+.card-btn.selected {
+    background: #1565c0;
+    border-color: #42a5f5;
+}
+
+.legal {
+    display: inline-block;
+    background: #333;
+    border-radius: 4px;
+    padding: 2px 6px;
+    margin: 2px;
+    font-size: 13px;
+}
+
+.params {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+}
+.params label { margin-right: 4px; }
+
+.btn-primary {
+    background: #4caf50;
+    color: #000;
+    font-size: 1.1em;
+    padding: 10px 24px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+}
+.btn-secondary {
+    background: #555;
+    color: #fff;
+    padding: 10px 16px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+}
+
